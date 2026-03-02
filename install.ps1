@@ -51,7 +51,6 @@ Get-ChildItem -Path $repoRoot -Directory | ForEach-Object {
     claude mcp add --scope user $mcpName node $entryPoint
 }
 
-Write-Host "Done. Run 'claude mcp list' to verify."
 
 # Install Ralph-Loop globally via PowerShell profile
 $ralphScript = Join-Path $repoRoot "ralph.ps1"
@@ -74,3 +73,6 @@ if (Test-Path $ralphScript) {
 } else {
     Write-Warning "ralph.ps1 not found in $repoRoot — skipping Ralph-Loop install"
 }
+
+Clear-Host
+Write-Host "Reload your shell: . `"$PROFILE`""
