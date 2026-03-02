@@ -1043,7 +1043,8 @@ function Publish-WorkerResults {
 function Merge-CleanPR {
     param(
         [int]$PRNumber,
-        [string]$TargetBranch
+        [string]$TargetBranch,
+        [string]$WorktreePath
     )
 
     Push-Location $MAIN_REPO
@@ -1111,6 +1112,65 @@ function Merge-CleanPR {
                 git push origin --delete $prBranch 2>&1 | Out-Null
             }
             return $true
+        }
+
+        # Not mergeable — try local rebase + force-push from a worktree
+        if ($WorktreePath -and (Test-Path $WorktreePath)) {
+            $prBranch = gh pr view $PRNumber --json headRefName --jq .headRefName 2>$null
+            if ($prBranch) {
+                Write-Log "  PR #${PRNumber}: rebasing locally..." "WARN"
+                Push-Location $WorktreePath
+                try {
+                    git fetch origin $prBranch $TargetBranch 2>&1 | Out-Null
+                    git checkout "origin/$prBranch" --detach 2>&1 | Out-Null
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Log "  PR #${PRNumber}: checkout failed" "WARN"
+                        return $false
+                    }
+
+                    $rebaseOut = git rebase "origin/$TargetBranch" 2>&1
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Log "  PR #${PRNumber}: rebase has conflicts, needs worker" "WARN"
+                        git rebase --abort 2>&1 | Out-Null
+                        return $false
+                    }
+
+                    # Verify no conflict markers after rebase
+                    $markers = git grep -l -E '^<{7} |^={7}$|^>{7} ' HEAD -- 2>$null
+                    if ($LASTEXITCODE -eq 0 -and $markers) {
+                        Write-Log "  PR #${PRNumber}: conflict markers after rebase, needs worker" "WARN"
+                        return $false
+                    }
+
+                    git push origin "HEAD:$prBranch" --force 2>&1 | Out-Null
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Log "  PR #${PRNumber}: force-push failed" "WARN"
+                        return $false
+                    }
+
+                    Write-Log "  PR #${PRNumber}: rebased and pushed" "OK"
+                }
+                finally {
+                    git checkout $TargetBranch 2>&1 | Out-Null
+                    Pop-Location
+                }
+
+                # Retry merge after rebase
+                Start-Sleep -Seconds 2  # Let GitHub process the push
+                $mergeOut = gh pr merge $PRNumber --rebase --delete-branch 2>&1
+                $mergeOutStr = "$mergeOut"
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Log "  PR #${PRNumber}: merged (after local rebase)" "OK"
+                    return $true
+                }
+                if ($mergeOutStr -match "already merged") {
+                    Write-Log "  PR #${PRNumber}: already merged" "OK"
+                    git push origin --delete $prBranch 2>&1 | Out-Null
+                    return $true
+                }
+                Write-Log "  PR #${PRNumber}: merge still failed after rebase: $mergeOutStr" "WARN"
+                return $false
+            }
         }
 
         Write-Log "  PR #${PRNumber}: merge failed: $mergeOutStr" "WARN"
@@ -1351,7 +1411,7 @@ function Invoke-DrainPendingPRs {
         # Try direct merge for non-conflicting PRs (no worker needed)
         if (-not $hasConflicts) {
             Write-Log "  PR #$prNum ($prBranch): attempting direct merge..."
-            if (Merge-CleanPR -PRNumber $prNum -TargetBranch $BaseBranch) {
+            if (Merge-CleanPR -PRNumber $prNum -TargetBranch $BaseBranch -WorktreePath $MergeWorktreePath) {
                 Cleanup-BranchAfterMerge -TaskBranch $prBranch
                 $drainedPRs[$prNum] = $true
                 continue
@@ -1976,7 +2036,7 @@ try {
                             # Try direct merge first for clean PRs
                             if (-not $mergeTarget.HasConflicts) {
                                 Write-Log "Worker ${workerId}: attempting direct merge of PR #$($mergeTarget.PRNumber) ($($mergeTarget.TaskBranch))..."
-                                if (Merge-CleanPR -PRNumber $mergeTarget.PRNumber -TargetBranch $BaseBranch) {
+                                if (Merge-CleanPR -PRNumber $mergeTarget.PRNumber -TargetBranch $BaseBranch -WorktreePath $mergeWorktreePath) {
                                     Cleanup-BranchAfterMerge -TaskBranch $mergeTarget.TaskBranch
                                     $needsWorker = $false
                                     # Don't set $dispatched — let this worker try Priority 2 (claim next task)
@@ -2125,7 +2185,7 @@ try {
                     # Try direct merge for non-conflicting PRs
                     if (-not $hasConflicts) {
                         Write-Log "  PR #$prNum ($prBranch): attempting direct merge..."
-                        if (Merge-CleanPR -PRNumber $prNum -TargetBranch $BaseBranch) {
+                        if (Merge-CleanPR -PRNumber $prNum -TargetBranch $BaseBranch -WorktreePath $mergeWorktreePath) {
                             Cleanup-BranchAfterMerge -TaskBranch $prBranch
                             $drainedPRs[$prNum] = $true
                             continue
