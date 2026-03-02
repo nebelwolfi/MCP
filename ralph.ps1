@@ -58,49 +58,6 @@ function Write-Log {
     Write-Host $Message -ForegroundColor $color
 }
 
-# ============================================================
-# Kanbn Board Path (mirrors kanban-mcp storage.ts / helpers.ts)
-# ============================================================
-
-function Get-KanbnBoardRoot {
-    param([string]$RepoPath)
-    # Node.js process.cwd() on Windows uses backslashes — match that format for the hash
-    $nodeStylePath = $RepoPath -replace '/', '\'
-    $sha256 = [System.Security.Cryptography.SHA256]::Create()
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($nodeStylePath)
-    $hashHex = ($sha256.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join ''
-    $sha256.Dispose()
-    return Join-Path (Join-Path (Join-Path $HOME ".boards") $hashHex.Substring(0, 12)) ".kanbn"
-}
-
-function Initialize-KanbnLink {
-    $boardRoot = Get-KanbnBoardRoot -RepoPath $MAIN_REPO
-    $localKanbn = ($MAIN_REPO -replace '/', '\') + "\.kanbn"
-    if (Test-Path $boardRoot) {
-        # Board was migrated by kanban-mcp — junction it into the local path so kanbn CLI can find it
-        if (-not (Test-Path $localKanbn)) {
-            New-Item -ItemType Junction -Path $localKanbn -Target $boardRoot | Out-Null
-            Write-Log "Created .kanbn junction -> $boardRoot" "OK"
-        }
-    } elseif (Test-Path $localKanbn) {
-        # Board still at local path (project not yet opened in Claude Code) — kanbn CLI can read it directly
-        Write-Log "Board found at local .kanbn/ (pre-migration)" "OK"
-    } else {
-        Write-Log "WARNING: No kanbn board found. Run 'kanbn init' in the project root first." "WARN"
-    }
-}
-
-function Remove-KanbnLink {
-    $localKanbn = ($MAIN_REPO -replace '/', '\') + "\.kanbn"
-    if (Test-Path $localKanbn) {
-        $item = Get-Item $localKanbn -ErrorAction SilentlyContinue
-        if ($item -and ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
-            $item.Delete()
-            Write-Log "Removed .kanbn junction"
-        }
-    }
-}
-
 function Stop-AllWorkerProcesses {
     # Kill claude/node processes spawned by our worktrees (not user's own sessions)
     $worktreePattern = [regex]::Escape($WORKTREE_ROOT)
@@ -1319,7 +1276,7 @@ function Start-Worker {
 # Handle -Cleanup flag
 if ($Cleanup) {
     Remove-AllWorktrees
-    exit 0
+    return
 }
 
 # Handle -MergeOnly flag: skip all task work, just drain pending PRs
@@ -1329,7 +1286,7 @@ if ($MergeOnly) {
     foreach ($cmd in @("claude", "git", "gh")) {
         if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
             Write-Host "Required command not found: $cmd" -ForegroundColor Red
-            exit 1
+            return
         }
     }
 
@@ -1343,7 +1300,7 @@ if ($MergeOnly) {
     $pendingPRs = @(Get-PendingRalphPRs)
     if ($pendingPRs.Count -eq 0) {
         Write-Log "No pending ralph PRs found." "OK"
-        exit 0
+        return
     }
 
     Write-Log "Found $($pendingPRs.Count) pending PR(s), draining..."
@@ -1438,19 +1395,19 @@ if ($MergeOnly) {
     }
 
     Write-Log "Merge-only complete" "OK"
-    exit 0
+    return
 }
 
 # Validate
 if ($Workers -lt 1) {
     Write-Host "Usage: ralph-parallel.ps1 [-Workers N] [-IterationsPerWorker N] [-BaseBranch branch]"
-    exit 1
+    return
 }
 
 foreach ($cmd in @("claude", "kanbn", "cmake", "git", "ninja", "gh")) {
     if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
         Write-Host "Required command not found: $cmd" -ForegroundColor Red
-        exit 1
+        return
     }
 }
 
@@ -1497,13 +1454,8 @@ try {
 
     if ($worktrees.Count -eq 0) {
         Write-Log "No worktrees were created successfully. Exiting." "ERROR"
-        exit 1
+        return
     }
-
-    # Link .kanbn/ to kanban-mcp board location so kanbn CLI can find it
-    Write-Log ""
-    Write-Log "Initializing kanbn board link..."
-    Initialize-KanbnLink
 
     # Sanitize Unicode in task files (em-dashes, smart quotes, etc.)
     Write-Log ""
@@ -1550,7 +1502,7 @@ try {
 
     if ($activeJobs.Count -eq 0) {
         Write-Log "No tasks to work on. Board may be empty." "WARN"
-        exit 0
+        return
     }
 
     # Phase 3: Monitor loop
@@ -2101,9 +2053,6 @@ finally {
         }
     }
     $script:claimedSubTasks.Clear()
-
-    # Remove .kanbn junction before worktree cleanup
-    Remove-KanbnLink
 
     # Remove worktrees
     foreach ($w in @($worktrees.Keys)) {
