@@ -7,7 +7,7 @@ A collection of utilities for use with Claude Code.
 Run this in PowerShell (no cloning needed):
 
 ```powershell
-iex (irm https://raw.githubusercontent.com/nebelwolfi/claude-utils/master/install.ps1)
+irm https://raw.githubusercontent.com/nebelwolfi/claude-utils/master/install.ps1 | iex
 ```
 
 This will:
@@ -35,4 +35,4 @@ claude mcp list
 
 | Name | Description |
 |------|-------------|
-| kanban-mcp | Kanban board MCP server, auto-detected from cwd |
+| kanban-mcp | Kanban board MCP server |

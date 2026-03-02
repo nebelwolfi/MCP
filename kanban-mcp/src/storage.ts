@@ -1,4 +1,4 @@
-import { readFile, writeFile, readdir, mkdir, unlink, access, rename } from "node:fs/promises";
+import { readFile, writeFile, readdir, mkdir, unlink, access, rename, cp, rm } from "node:fs/promises";
 import { basename, dirname } from "node:path";
 import type { Task, BoardIndex } from "./types.js";
 import { TASKS_DIR, INDEX_FILE, DEFAULT_COLUMNS } from "./constants.js";
@@ -77,7 +77,8 @@ export async function ensureBoard(): Promise<void> {
   try {
     await access(localKanbanPath(INDEX_FILE));
     await mkdir(dirname(kanbanPath()), { recursive: true });
-    await rename(localKanbanPath(), kanbanPath());
+    await cp(localKanbanPath(), kanbanPath(), { recursive: true });
+    await rm(localKanbanPath(), { recursive: true, force: true });
     return;
   } catch { /* no local board to migrate */ }
   await mkdir(kanbanPath(TASKS_DIR), { recursive: true });

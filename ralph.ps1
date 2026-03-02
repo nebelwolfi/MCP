@@ -55,6 +55,46 @@ function Write-Log {
     Write-Host $Message -ForegroundColor $color
 }
 
+# ============================================================
+# Kanbn Board Path (mirrors kanban-mcp storage.ts / helpers.ts)
+# ============================================================
+
+function Get-KanbnBoardRoot {
+    param([string]$RepoPath)
+    # Node.js process.cwd() on Windows uses backslashes — match that format for the hash
+    $nodeStylePath = $RepoPath -replace '/', '\'
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($nodeStylePath)
+    $hashHex = ($sha256.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join ''
+    $sha256.Dispose()
+    return Join-Path $HOME ".boards" $hashHex.Substring(0, 12) ".kanbn"
+}
+
+function Initialize-KanbnLink {
+    $boardRoot = Get-KanbnBoardRoot -RepoPath $MAIN_REPO
+    $localKanbn = ($MAIN_REPO -replace '/', '\') + "\.kanbn"
+    if (-not (Test-Path $boardRoot)) {
+        Write-Log "WARNING: kanban-mcp board not found at: $boardRoot" "WARN"
+        Write-Log "  Ensure Claude Code has opened this project once to initialize the board" "WARN"
+        return
+    }
+    if (-not (Test-Path $localKanbn)) {
+        New-Item -ItemType Junction -Path $localKanbn -Target $boardRoot | Out-Null
+        Write-Log "Created .kanbn junction -> $boardRoot" "OK"
+    }
+}
+
+function Remove-KanbnLink {
+    $localKanbn = ($MAIN_REPO -replace '/', '\') + "\.kanbn"
+    if (Test-Path $localKanbn) {
+        $item = Get-Item $localKanbn -ErrorAction SilentlyContinue
+        if ($item -and ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            $item.Delete()
+            Write-Log "Removed .kanbn junction"
+        }
+    }
+}
+
 function Stop-AllWorkerProcesses {
     # Kill claude/node processes spawned by our worktrees (not user's own sessions)
     $worktreePattern = [regex]::Escape($WORKTREE_ROOT)
@@ -668,14 +708,11 @@ YOUR ASSIGNED TASK ID: $TaskId
 $subTaskInstructions
 
 1. Work ONLY on the assigned task above. Do not pick a different task.
-Review your task:
-``````bash
-kanbn task "$TaskId"
-``````
+Review your task using kanban mcp.
 
 2. Break down what needs to happen.
 If the task is too large (more than ~200 lines of changes), break it into
-smaller sub-tasks first using kanbn edit.
+smaller sub-tasks first using kanban mcp edit.
 
 3. Check that the tests pass.
 
@@ -690,7 +727,7 @@ ONLY WORK ON THIS SINGLE TASK. IF THE TASK HAS SUBTASKS, COMPLETE ONLY ONE.
 
 - **Never skip tests.** If you can't test it, you can't ship it.
 - **Never leave the build broken** between cycles. Every cycle ends with a green build.
-- **If a task reveals missing infrastructure**, create a new task with kanbn add, set it as a blocker relation, and work on it first.
+- **If a task reveals missing infrastructure**, create a new task with kanban mcp, set it as a blocker relation, and work on it first.
 - **Commit atomically.** Each completed task should be one logical unit - all its files work together.
 "@
 
@@ -1457,6 +1494,11 @@ try {
         exit 1
     }
 
+    # Link .kanbn/ to kanban-mcp board location so kanbn CLI can find it
+    Write-Log ""
+    Write-Log "Initializing kanbn board link..."
+    Initialize-KanbnLink
+
     # Sanitize Unicode in task files (em-dashes, smart quotes, etc.)
     Write-Log ""
     Write-Log "Sanitizing task files..."
@@ -2053,6 +2095,9 @@ finally {
         }
     }
     $script:claimedSubTasks.Clear()
+
+    # Remove .kanbn junction before worktree cleanup
+    Remove-KanbnLink
 
     # Remove worktrees
     foreach ($w in @($worktrees.Keys)) {

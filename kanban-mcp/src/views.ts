@@ -1,6 +1,7 @@
-import { boardExists, readIndex, getAllTasksWithColumns, listOrphanedFiles, readTask } from "./storage.js";
+import { boardExists, readIndex, getAllTasksWithColumns, listOrphanedFiles, readTask, ensureBoard } from "./storage.js";
 
 export async function boardView(): Promise<string> {
+  await ensureBoard();
   if (!(await boardExists())) return "No board found. Create a task to auto-initialize.";
   const { tasks, index } = await getAllTasksWithColumns();
   const byId = Object.fromEntries(tasks.map((t) => [t.id, t]));
@@ -29,6 +30,7 @@ export async function boardView(): Promise<string> {
 }
 
 export async function boardStats(): Promise<string> {
+  await ensureBoard();
   if (!(await boardExists())) return "No board found.";
   const { tasks, index } = await getAllTasksWithColumns();
   const total = tasks.length;
@@ -54,6 +56,7 @@ export async function boardStats(): Promise<string> {
 }
 
 export async function boardValidate(): Promise<string> {
+  await ensureBoard();
   if (!(await boardExists())) return "No board found.";
   const index = await readIndex();
   const issues: string[] = [];
