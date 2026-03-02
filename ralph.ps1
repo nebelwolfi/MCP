@@ -16,11 +16,14 @@ param(
     [switch]$MergeOnly,
 
     [Parameter(Mandatory=$false)]
-    [string]$BaseBranch
+    [string]$BaseBranch,
+
+    [Parameter(Mandatory=$false)]
+    [string]$ProjectDir = (Get-Location).Path
 )
 
 $ErrorActionPreference = 'Continue'
-$MAIN_REPO = (git -C $PSScriptRoot rev-parse --show-toplevel) -replace '\\', '/'
+$MAIN_REPO = (git -C $ProjectDir rev-parse --show-toplevel) -replace '\\', '/'
 
 # Auto-detect default branch if not specified
 if (-not $BaseBranch) {
