@@ -474,19 +474,23 @@ function Complete-SubTaskInRepo {
 
     if (-not $SubTaskText) { return $false }
 
-    # Escape inner double quotes so they survive PowerShell -> native command arg passing
-    $escaped = $SubTaskText -replace '"', '\"'
-    $arg = "[x] $escaped"
+    # Edit the task markdown directly to avoid kanbn CLI escaping issues
+    # with special characters (quotes, parens, backticks, brackets)
+    $taskFile = "$RepoPath/.kanbn/tasks/$TaskId.md"
+    if (-not (Test-Path $taskFile)) { return $false }
 
-    Push-Location $RepoPath
-    try {
-        $null = kanbn edit $TaskId --sub-task $arg 2>$null
-        if ($LASTEXITCODE -ne 0) { return $false }
-        return $true
+    $content = [System.IO.File]::ReadAllText($taskFile, [System.Text.Encoding]::UTF8)
+    $escapedText = [regex]::Escape($SubTaskText)
+    $pattern = "(?m)^(\s*[-*]\s*)\[ \](\s+$escapedText\s*$)"
+    $replacement = '${1}[x]${2}'
+
+    $newContent = [regex]::Replace($content, $pattern, $replacement)
+    if ($newContent -eq $content) {
+        return $false
     }
-    finally {
-        Pop-Location
-    }
+
+    [System.IO.File]::WriteAllText($taskFile, $newContent, [System.Text.Encoding]::UTF8)
+    return $true
 }
 
 function Get-TaskColumn {
@@ -646,6 +650,84 @@ function Test-BoardComplete {
     return $true
 }
 
+function New-TaskPR {
+    param([string]$TaskId)
+
+    $taskBranch = "ralph/$TaskId"
+
+    Push-Location $MAIN_REPO
+    try {
+        $existingPr = gh pr view $taskBranch --json number 2>$null
+        if ($LASTEXITCODE -eq 0 -and $existingPr) {
+            return  # PR already exists
+        }
+
+        # Only create if the branch exists on remote with actual changes
+        $remoteExists = git ls-remote --heads origin $taskBranch 2>$null
+        if (-not $remoteExists) { return }
+
+        $hasChanges = git cherry "origin/$BaseBranch" "origin/$taskBranch" 2>$null | Select-String '^\+'
+        if (-not $hasChanges) { return }
+
+        $prUrl = gh pr create --base $BaseBranch --head $taskBranch `
+            --title "ralph: $TaskId" `
+            --body "Automated PR for completed task **$TaskId**." 2>&1
+        if ($LASTEXITCODE -eq 0 -and $prUrl) {
+            Write-Log "Created PR for completed task ${TaskId}: $prUrl" "OK"
+        } else {
+            Write-Log "PR creation failed for ${TaskId}: $prUrl" "WARN"
+        }
+    }
+    finally {
+        Pop-Location
+    }
+}
+
+function New-PRsForDoneTasks {
+    $board = Get-BoardJson -RepoPath $MAIN_REPO
+    if (-not $board) {
+        Write-Log "Cannot read board for Done-task PR sweep" "WARN"
+        return
+    }
+
+    $doneIndex = Get-ColumnIndex -Board $board -ColumnName "Done"
+    if ($doneIndex -lt 0) { return }
+
+    # Collect all task IDs in the Done column
+    $doneTaskIds = @{}
+    foreach ($lane in $board.lanes) {
+        if ($doneIndex -ge $lane.columns.Count) { continue }
+        foreach ($task in (Get-ColumnTaskItems -ColumnTasks $lane.columns[$doneIndex])) {
+            $taskId = Get-TaskId -Task $task
+            if ($taskId) { $doneTaskIds[$taskId] = $true }
+        }
+    }
+
+    if ($doneTaskIds.Count -eq 0) { return }
+
+    # Match remote ralph/* branches against Done tasks
+    $remoteBranches = git -C $MAIN_REPO ls-remote --heads origin "ralph/*" 2>$null
+    if (-not $remoteBranches) { return }
+
+    $created = 0
+    foreach ($line in @($remoteBranches)) {
+        if ($line -match 'refs/heads/(ralph/.+)$') {
+            $remoteBranch = $Matches[1]
+            if ($remoteBranch -match '^ralph/worker-\d+$') { continue }
+
+            $taskId = $remoteBranch -replace '^ralph/', ''
+            if ($doneTaskIds.ContainsKey($taskId)) {
+                New-TaskPR -TaskId $taskId
+                $created++
+            }
+        }
+    }
+
+    if ($created -gt 0) {
+        Write-Log "Created $created PR(s) for Done tasks with orphan branches" "OK"
+    }
+}
+
 function Get-WorkerPrompt {
     param(
         [string]$TaskId,
@@ -723,10 +805,19 @@ function Switch-WorktreeToTaskBranch {
         $taskBranch = "ralph/$TaskId"
         git fetch origin $BaseBranchName $taskBranch 2>&1 | Out-Null
 
+        # Unmark assume-unchanged on .kanbn files so git can see and discard them
+        $kanbnFiles = git ls-files .kanbn 2>$null
+        if ($kanbnFiles) {
+            $kanbnFiles | ForEach-Object {
+                git update-index --no-assume-unchanged $_ 2>$null | Out-Null
+            }
+        }
+        # Discard any dirty .kanbn changes before switching branches
+        git checkout -- .kanbn 2>&1 | Out-Null
+
         # Check if local branch already exists
         $localExists = git rev-parse --verify $taskBranch 2>$null
         if ($localExists) {
-            git checkout -- .kanbn 2>&1 | Out-Null
             $checkoutOut = git checkout $taskBranch 2>&1
             if ($LASTEXITCODE -ne 0) {
                 Write-Log "  Failed to checkout $taskBranch : $checkoutOut" "ERROR"
@@ -1561,7 +1652,7 @@ try {
                             -TargetBranch $BaseBranch
 
                         if ($published) {
-                            Write-Log "Worker ${workerId}: published PR for $($jobInfo.TaskId)" "OK"
+                            Write-Log "Worker ${workerId}: pushed branch for $($jobInfo.TaskId)" "OK"
                         } else {
                             Write-Log "Worker ${workerId}: publish failed for $($jobInfo.TaskId)" "ERROR"
                         }
@@ -1604,20 +1695,7 @@ try {
                         try {
                             if ($allSubTasksComplete) {
                                 kanbn move $jobInfo.TaskId -c "Done" 2>$null | Out-Null
-
-                                # Create PR now that task is fully complete
-                                $taskBranch = "ralph/$($jobInfo.TaskId)"
-                                $existingPr = gh pr view $taskBranch --json number 2>$null
-                                if ($LASTEXITCODE -ne 0 -or -not $existingPr) {
-                                    $prUrl = gh pr create --base $BaseBranch --head $taskBranch `
-                                        --title "ralph: $($jobInfo.TaskId)" `
-                                        --body "Automated PR for completed task **$($jobInfo.TaskId)**." 2>&1
-                                    if ($LASTEXITCODE -eq 0 -and $prUrl) {
-                                        Write-Log "Created PR for completed task $($jobInfo.TaskId): $prUrl" "OK"
-                                    } else {
-                                        Write-Log "PR creation failed for $($jobInfo.TaskId): $prUrl" "WARN"
-                                    }
-                                }
+                                New-TaskPR -TaskId $jobInfo.TaskId
                             } else {
                                 kanbn move $jobInfo.TaskId -c "In Progress" 2>$null | Out-Null
                                 Write-Log "Task $($jobInfo.TaskId) moved back to In Progress (incomplete subtasks)" "WARN"
@@ -1696,10 +1774,13 @@ try {
                                     $dispatched = $true
                                     $advanced = $true
                                 } else {
-                                    # All subtasks done — move to Done, release claim
+                                    # All subtasks done — move to Done, create PR, release claim
                                     Write-Log "All subtasks complete for $($jobInfo.TaskId), moving to Done" "OK"
                                     Push-Location $MAIN_REPO
-                                    try { kanbn move $jobInfo.TaskId -c "Done" 2>$null | Out-Null }
+                                    try {
+                                        kanbn move $jobInfo.TaskId -c "Done" 2>$null | Out-Null
+                                        New-TaskPR -TaskId $jobInfo.TaskId
+                                    }
                                     finally { Pop-Location }
                                     Release-TaskClaim -TaskId $jobInfo.TaskId
                                     $advanced = $true
@@ -2087,6 +2168,9 @@ finally {
             Write-Log "  Cleaned up local branch: $branch" "OK"
         }
     }
+
+    # Create PRs for Done tasks whose remote branches lack one
+    New-PRsForDoneTasks
 
     # Prune stale worktree refs
     git -C $MAIN_REPO worktree prune 2>$null | Out-Null
