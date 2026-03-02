@@ -58,6 +58,28 @@ function Write-Log {
     Write-Host $Message -ForegroundColor $color
 }
 
+function Ensure-UnionMergeForProgressTxt {
+    $gitattributes = "$MAIN_REPO/.gitattributes"
+    $unionRule = "progress.txt merge=union"
+    $needsCommit = $false
+    if (Test-Path $gitattributes) {
+        $content = Get-Content $gitattributes -Raw
+        if ($content -notmatch 'progress\.txt\s+merge=union') {
+            Add-Content $gitattributes "`n$unionRule"
+            $needsCommit = $true
+        }
+    } else {
+        Set-Content $gitattributes $unionRule
+        $needsCommit = $true
+    }
+    if ($needsCommit) {
+        git -C $MAIN_REPO add .gitattributes 2>$null
+        git -C $MAIN_REPO commit -m "chore: add union merge strategy for progress.txt" 2>$null
+        git -C $MAIN_REPO push origin $BaseBranch 2>$null
+        Write-Log "Added .gitattributes with union merge for progress.txt" "OK"
+    }
+}
+
 function Stop-AllWorkerProcesses {
     # Kill claude/node processes spawned by our worktrees (not user's own sessions)
     $worktreePattern = [regex]::Escape($WORKTREE_ROOT)
@@ -1591,6 +1613,8 @@ if ($MergeOnly) {
     Write-Log "Merge workers: $mergeWorkers | Base branch: $BaseBranch | Main repo: $MAIN_REPO"
     Write-Host ""
 
+    Ensure-UnionMergeForProgressTxt
+
     $mergeWorktreePath = New-MergeWorktree
     if (-not $mergeWorktreePath) {
         Write-Log "Failed to create merge worktree, aborting" "ERROR"
@@ -1641,7 +1665,8 @@ $totalIterations = 0
 $boardComplete = $false
 
 try {
-    # Phase 1: Setup worktrees
+    # Phase 1: Setup
+    Ensure-UnionMergeForProgressTxt
     Write-Log "Phase 1: Setting up $Workers worktrees..."
     for ($w = 1; $w -le $Workers; $w++) {
         Write-Log "--- Worker $w setup ---"
