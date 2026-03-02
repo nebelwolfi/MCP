@@ -70,7 +70,7 @@ function Get-KanbnBoardRoot {
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($nodeStylePath)
     $hashHex = ($sha256.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join ''
     $sha256.Dispose()
-    return Join-Path $HOME ".boards" $hashHex.Substring(0, 12) ".kanbn"
+    return Join-Path (Join-Path (Join-Path $HOME ".boards") $hashHex.Substring(0, 12)) ".kanbn"
 }
 
 function Initialize-KanbnLink {
