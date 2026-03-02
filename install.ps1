@@ -10,7 +10,8 @@ if (-not $PSScriptRoot -or $PSScriptRoot -eq "") {
     if (Test-Path $InstallDir) {
         Write-Host "Directory exists, pulling latest..."
         Push-Location $InstallDir
-        git pull --quiet
+        git fetch origin --quiet
+        git reset --hard origin/master --quiet
         Pop-Location
     } else {
         git clone $repo $InstallDir --quiet
