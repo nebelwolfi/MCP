@@ -693,11 +693,17 @@ function New-TaskPR {
 
         # Fetch the task branch so local tracking refs are current
         # (Publish-WorkerResults pushes from a worktree, so $MAIN_REPO refs are stale)
-        git fetch origin $taskBranch $BaseBranch 2>$null
-        if ($LASTEXITCODE -ne 0) { return }  # branch doesn't exist on remote
+        git fetch origin "refs/heads/${taskBranch}:refs/remotes/origin/${taskBranch}" "refs/heads/${BaseBranch}:refs/remotes/origin/${BaseBranch}" 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Log "  PR skip ${TaskId}: fetch failed (branch may not exist on remote)" "WARN"
+            return
+        }
 
         $hasChanges = git cherry "origin/$BaseBranch" "origin/$taskBranch" 2>$null | Select-String '^\+'
-        if (-not $hasChanges) { return }
+        if (-not $hasChanges) {
+            Write-Log "  PR skip ${TaskId}: no changes vs $BaseBranch" "WARN"
+            return
+        }
 
         $prUrl = gh pr create --base $BaseBranch --head $taskBranch `
             --title "ralph: $TaskId" `
@@ -747,14 +753,14 @@ function New-PRsForDoneTasks {
 
             $taskId = $remoteBranch -replace '^ralph/', ''
             if ($doneTaskIds.ContainsKey($taskId)) {
-                New-TaskPR -TaskId $taskId
                 $created++
+                New-TaskPR -TaskId $taskId
             }
         }
     }
 
     if ($created -gt 0) {
-        Write-Log "Created $created PR(s) for Done tasks with orphan branches" "OK"
+        Write-Log "Processed $created Done task(s) with remote branches" "OK"
     }
 }
 
@@ -1297,12 +1303,12 @@ function Start-MergeReviewWorker {
 function Get-PendingRalphPRs {
     Push-Location $MAIN_REPO
     try {
-        $prs = gh pr list --search "ralph:" --json number,headRefName,mergeable,mergeStateStatus 2>$null
+        $prs = gh pr list --json number,headRefName,mergeable,mergeStateStatus 2>$null
         if ($LASTEXITCODE -ne 0 -or -not $prs) { return @() }
 
         $parsed = $prs | ConvertFrom-Json -ErrorAction SilentlyContinue
         if (-not $parsed) { return @() }
-        return @($parsed)
+        return @($parsed | Where-Object { $_.headRefName -like "ralph/*" })
     }
     finally {
         Pop-Location
