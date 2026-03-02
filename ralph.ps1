@@ -76,14 +76,17 @@ function Get-KanbnBoardRoot {
 function Initialize-KanbnLink {
     $boardRoot = Get-KanbnBoardRoot -RepoPath $MAIN_REPO
     $localKanbn = ($MAIN_REPO -replace '/', '\') + "\.kanbn"
-    if (-not (Test-Path $boardRoot)) {
-        Write-Log "WARNING: kanban-mcp board not found at: $boardRoot" "WARN"
-        Write-Log "  Ensure Claude Code has opened this project once to initialize the board" "WARN"
-        return
-    }
-    if (-not (Test-Path $localKanbn)) {
-        New-Item -ItemType Junction -Path $localKanbn -Target $boardRoot | Out-Null
-        Write-Log "Created .kanbn junction -> $boardRoot" "OK"
+    if (Test-Path $boardRoot) {
+        # Board was migrated by kanban-mcp — junction it into the local path so kanbn CLI can find it
+        if (-not (Test-Path $localKanbn)) {
+            New-Item -ItemType Junction -Path $localKanbn -Target $boardRoot | Out-Null
+            Write-Log "Created .kanbn junction -> $boardRoot" "OK"
+        }
+    } elseif (Test-Path $localKanbn) {
+        # Board still at local path (project not yet opened in Claude Code) — kanbn CLI can read it directly
+        Write-Log "Board found at local .kanbn/ (pre-migration)" "OK"
+    } else {
+        Write-Log "WARNING: No kanbn board found. Run 'kanbn init' in the project root first." "WARN"
     }
 }
 
@@ -2141,9 +2144,8 @@ finally {
 Write-Host ""
 if ($boardComplete) {
     Write-Host "Kanbn board is complete!" -ForegroundColor Green
-    exit 0
+} else {
+    Write-Host "Completed $totalCompleted total iterations across $Workers workers." -ForegroundColor Cyan
 }
-
-Write-Host "Completed $totalCompleted total iterations across $Workers workers." -ForegroundColor Cyan
 
 } # end Ralph-Loop
