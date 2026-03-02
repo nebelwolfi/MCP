@@ -691,9 +691,10 @@ function New-TaskPR {
             return  # PR already exists
         }
 
-        # Only create if the branch exists on remote with actual changes
-        $remoteExists = git ls-remote --heads origin $taskBranch 2>$null
-        if (-not $remoteExists) { return }
+        # Fetch the task branch so local tracking refs are current
+        # (Publish-WorkerResults pushes from a worktree, so $MAIN_REPO refs are stale)
+        git fetch origin $taskBranch $BaseBranch 2>$null
+        if ($LASTEXITCODE -ne 0) { return }  # branch doesn't exist on remote
 
         $hasChanges = git cherry "origin/$BaseBranch" "origin/$taskBranch" 2>$null | Select-String '^\+'
         if (-not $hasChanges) { return }
@@ -1525,6 +1526,7 @@ if ($MergeOnly) {
     Patch-ClaudeMD -WorktreePath $mergeWorktreePath
 
     try {
+        New-PRsForDoneTasks
         Invoke-DrainPendingPRs -MergeWorktreePath $mergeWorktreePath
     }
     finally {
