@@ -616,6 +616,17 @@ function Repair-DoneCardsWithIncompleteSubTasks {
     }
 }
 
+function Get-CheckedOutTaskBranches {
+    $checkedOut = @{}
+    foreach ($w in $worktrees.Keys) {
+        $branch = git -C $worktrees[$w] rev-parse --abbrev-ref HEAD 2>$null
+        if ($branch -and $branch -match '^ralph/(.+)$') {
+            $checkedOut[$Matches[1]] = $w
+        }
+    }
+    return $checkedOut
+}
+
 function Claim-NextTask {
     param([int]$WorkerId)
 
@@ -624,6 +635,9 @@ function Claim-NextTask {
         Write-Log "Failed to read kanbn board" "ERROR"
         return $null
     }
+
+    # Check which task branches are already checked out in other worktrees
+    $checkedOutBranches = Get-CheckedOutTaskBranches
 
     $inProgressIndex = Get-ColumnIndex -Board $board -ColumnName "In Progress"
     $todoIndex = Get-ColumnIndex -Board $board -ColumnName "Todo"
@@ -638,6 +652,7 @@ function Claim-NextTask {
                 $taskId = Get-TaskId -Task $task
                 if (-not $taskId) { continue }
                 if ($script:claimedTasks.ContainsKey($taskId)) { continue }
+                if ($checkedOutBranches.ContainsKey($taskId)) { continue }
 
                 $taskObj = if ($task.PSObject.Properties["subTasks"]) { $task } else { Get-TaskJson -RepoPath $MAIN_REPO -TaskId $taskId }
                 $claimedSubTask = Get-FirstIncompleteSubTask -Task $taskObj
@@ -1232,13 +1247,11 @@ function Get-MergeReviewPrompt {
     param(
         [int]$PRNumber,
         [string]$TaskBranch,
-        [string]$TargetBranch,
-        [bool]$HasConflicts
+        [string]$TargetBranch
     )
 
-    if ($HasConflicts) {
-        return @"
-You are reviewing and merging a pull request that has merge conflicts.
+    return @"
+You are resolving merge conflicts and merging a pull request.
 
 PR #$PRNumber (branch: $TaskBranch -> $TargetBranch)
 
@@ -1298,41 +1311,6 @@ gh pr comment $PRNumber --body "Unable to auto-resolve conflicts: [explain what 
 
 CRITICAL: Never push files containing conflict markers. Always verify with git grep before pushing.
 "@
-    } else {
-        return @"
-You are reviewing a pull request before merging it.
-
-PR #$PRNumber (branch: $TaskBranch -> $TargetBranch)
-
-Steps:
-1. Review the PR diff:
-``````bash
-gh pr diff $PRNumber
-``````
-
-2. Check for conflict markers in the diff (this is critical - reject if found):
-``````bash
-gh pr diff $PRNumber | grep -n -E '^[+](<{7} |={7}$|>{7} )'
-``````
-If any results appear, do NOT merge. Leave a comment:
-``````bash
-gh pr comment $PRNumber --body "PR contains conflict markers in the diff. Needs conflict resolution."
-``````
-
-3. If the diff looks correct and contains no conflict markers, merge:
-``````bash
-gh pr merge $PRNumber --rebase --delete-branch
-``````
-
-4. If the merge fails (e.g., base branch moved), try fetching and retrying:
-``````bash
-git fetch origin $TargetBranch
-gh pr merge $PRNumber --rebase --delete-branch
-``````
-
-If the merge still fails, leave the PR open - it will be retried next cycle.
-"@
-    }
 }
 
 function Start-MergeReviewWorker {
@@ -1341,12 +1319,11 @@ function Start-MergeReviewWorker {
         [int]$PRNumber,
         [string]$TaskBranch,
         [string]$TargetBranch,
-        [bool]$HasConflicts,
         [string]$LogFile,
         [string]$WorktreePath
     )
 
-    $prompt = Get-MergeReviewPrompt -PRNumber $PRNumber -TaskBranch $TaskBranch -TargetBranch $TargetBranch -HasConflicts $HasConflicts
+    $prompt = Get-MergeReviewPrompt -PRNumber $PRNumber -TaskBranch $TaskBranch -TargetBranch $TargetBranch
 
     $targetBranchCapture = $TargetBranch
 
@@ -1426,25 +1403,18 @@ function Invoke-DrainPendingPRs {
     foreach ($pr in $pendingPRs) {
         $prNum = $pr.number
         $prBranch = $pr.headRefName
-        $mergeable = if ($pr.PSObject.Properties["mergeable"]) { $pr.mergeable } else { "UNKNOWN" }
-        $mergeState = if ($pr.PSObject.Properties["mergeStateStatus"]) { $pr.mergeStateStatus } else { "UNKNOWN" }
 
         if ($drainedPRs.ContainsKey($prNum)) { continue }
 
-        $hasConflicts = ($mergeable -ieq "CONFLICTING") -or ($mergeState -ieq "DIRTY")
-
-        # Try direct merge for non-conflicting PRs (no worker needed)
-        if (-not $hasConflicts) {
-            Write-Log "  PR #$prNum ($prBranch): attempting direct merge..."
-            if (Merge-CleanPR -PRNumber $prNum -TargetBranch $BaseBranch -WorktreePath $MergeWorktreePath) {
-                Cleanup-BranchAfterMerge -TaskBranch $prBranch
-                $drainedPRs[$prNum] = $true
-                continue
-            }
-            Write-Log "  PR #${prNum}: direct merge failed, dispatching worker for review" "WARN"
+        # Try direct merge + local rebase first
+        Write-Log "  PR #$prNum ($prBranch): attempting merge..."
+        if (Merge-CleanPR -PRNumber $prNum -TargetBranch $BaseBranch -WorktreePath $MergeWorktreePath) {
+            Cleanup-BranchAfterMerge -TaskBranch $prBranch
+            $drainedPRs[$prNum] = $true
+            continue
         }
 
-        # Fall back to worker for conflicts or failed direct merge
+        # Fall back to worker for conflict resolution
         $pickWorker = $null
         foreach ($w in $availableWorkers) {
             if (-not $drainJobs.ContainsKey($w)) {
@@ -1473,13 +1443,12 @@ function Invoke-DrainPendingPRs {
         }
 
         $logFile = "$LOG_DIR/worker-$pickWorker.log"
-        Write-Log "  Worker $pickWorker dispatched on merge review: PR #$prNum ($prBranch)$(if ($hasConflicts) { ' [CONFLICTS]' })"
+        Write-Log "  Worker $pickWorker dispatched on merge review: PR #$prNum ($prBranch)"
         $job = Start-MergeReviewWorker `
             -WorkerId $pickWorker `
             -PRNumber $prNum `
             -TaskBranch $prBranch `
             -TargetBranch $BaseBranch `
-            -HasConflicts $hasConflicts `
             -LogFile $logFile `
             -WorktreePath $MergeWorktreePath
 
@@ -2030,8 +1999,6 @@ try {
                         foreach ($pr in $pendingPRs) {
                             $prNum = $pr.number
                             $prBranch = $pr.headRefName
-                            $mergeable = if ($pr.PSObject.Properties["mergeable"]) { $pr.mergeable } else { "UNKNOWN" }
-                            $mergeState = if ($pr.PSObject.Properties["mergeStateStatus"]) { $pr.mergeStateStatus } else { "UNKNOWN" }
 
                             # Skip PRs already being reviewed by another worker
                             $alreadyClaimed = $false
@@ -2047,41 +2014,29 @@ try {
                             $justReviewedBranch = if ($jobInfo.ContainsKey("TaskBranch")) { $jobInfo.TaskBranch } else { $null }
                             if ($justReviewedBranch -and $prBranch -eq $justReviewedBranch) { continue }
 
-                            # Note: UNKNOWN mergeability is fine - gh pr merge will fail gracefully if conflicts exist
-
-                            $hasConflicts = ($mergeable -ieq "CONFLICTING") -or ($mergeState -ieq "DIRTY")
                             $mergeTarget = @{
                                 PRNumber = $prNum
                                 TaskBranch = $prBranch
-                                HasConflicts = $hasConflicts
                             }
                             break
                         }
 
                         if ($mergeTarget) {
-                            $needsWorker = $true
-
-                            # Try direct merge first for clean PRs
-                            if (-not $mergeTarget.HasConflicts) {
-                                Write-Log "Worker ${workerId}: attempting direct merge of PR #$($mergeTarget.PRNumber) ($($mergeTarget.TaskBranch))..."
-                                if (Merge-CleanPR -PRNumber $mergeTarget.PRNumber -TargetBranch $BaseBranch -WorktreePath $mergeWorktreePath) {
-                                    Cleanup-BranchAfterMerge -TaskBranch $mergeTarget.TaskBranch
-                                    $needsWorker = $false
-                                    # Don't set $dispatched - let this worker try Priority 2 (claim next task)
-                                }
-                            }
-
-                            # Fall back to worker for conflicts or failed direct merge
-                            if ($needsWorker) {
+                            # Try direct merge + local rebase first
+                            Write-Log "Worker ${workerId}: attempting merge of PR #$($mergeTarget.PRNumber) ($($mergeTarget.TaskBranch))..."
+                            if (Merge-CleanPR -PRNumber $mergeTarget.PRNumber -TargetBranch $BaseBranch -WorktreePath $mergeWorktreePath) {
+                                Cleanup-BranchAfterMerge -TaskBranch $mergeTarget.TaskBranch
+                                # Don't set $dispatched — let this worker try Priority 2 (claim next task)
+                            } else {
+                                # Fall back to worker for conflict resolution
                                 $logFile = "$LOG_DIR/worker-$workerId.log"
-                                Write-Log "Worker $workerId dispatched on merge review: PR #$($mergeTarget.PRNumber) ($($mergeTarget.TaskBranch))$(if ($mergeTarget.HasConflicts) { ' [CONFLICTS]' })"
+                                Write-Log "Worker $workerId dispatched on merge review: PR #$($mergeTarget.PRNumber) ($($mergeTarget.TaskBranch))"
 
                                 $newJob = Start-MergeReviewWorker `
                                     -WorkerId $workerId `
                                     -PRNumber $mergeTarget.PRNumber `
                                     -TaskBranch $mergeTarget.TaskBranch `
                                     -TargetBranch $BaseBranch `
-                                    -HasConflicts $mergeTarget.HasConflicts `
                                     -LogFile $logFile `
                                     -WorktreePath $mergeWorktreePath
 
@@ -2203,25 +2158,18 @@ try {
                 foreach ($pr in $pendingPRs) {
                     $prNum = $pr.number
                     $prBranch = $pr.headRefName
-                    $mergeable = if ($pr.PSObject.Properties["mergeable"]) { $pr.mergeable } else { "UNKNOWN" }
-                    $mergeState = if ($pr.PSObject.Properties["mergeStateStatus"]) { $pr.mergeStateStatus } else { "UNKNOWN" }
 
                     if ($drainedPRs.ContainsKey($prNum)) { continue }
 
-                    $hasConflicts = ($mergeable -ieq "CONFLICTING") -or ($mergeState -ieq "DIRTY")
-
-                    # Try direct merge for non-conflicting PRs
-                    if (-not $hasConflicts) {
-                        Write-Log "  PR #$prNum ($prBranch): attempting direct merge..."
-                        if (Merge-CleanPR -PRNumber $prNum -TargetBranch $BaseBranch -WorktreePath $mergeWorktreePath) {
-                            Cleanup-BranchAfterMerge -TaskBranch $prBranch
-                            $drainedPRs[$prNum] = $true
-                            continue
-                        }
-                        Write-Log "  PR #${prNum}: direct merge failed, dispatching worker" "WARN"
+                    # Try direct merge + local rebase first
+                    Write-Log "  PR #$prNum ($prBranch): attempting merge..."
+                    if (Merge-CleanPR -PRNumber $prNum -TargetBranch $BaseBranch -WorktreePath $mergeWorktreePath) {
+                        Cleanup-BranchAfterMerge -TaskBranch $prBranch
+                        $drainedPRs[$prNum] = $true
+                        continue
                     }
 
-                    # Fall back to worker for conflicts or failed direct merge
+                    # Fall back to worker for conflict resolution
                     $pickWorker = $null
                     foreach ($w in $availableWorkers) {
                         if (-not $drainJobs.ContainsKey($w)) {
@@ -2253,13 +2201,12 @@ try {
                     }
 
                     $logFile = "$LOG_DIR/worker-$pickWorker.log"
-                    Write-Log "  Worker $pickWorker dispatched on drain merge review: PR #$prNum ($prBranch)$(if ($hasConflicts) { ' [CONFLICTS]' })"
+                    Write-Log "  Worker $pickWorker dispatched on drain merge review: PR #$prNum ($prBranch)"
                     $job = Start-MergeReviewWorker `
                         -WorkerId $pickWorker `
                         -PRNumber $prNum `
                         -TaskBranch $prBranch `
                         -TargetBranch $BaseBranch `
-                        -HasConflicts $hasConflicts `
                         -LogFile $logFile `
                         -WorktreePath $mergeWorktreePath
 
