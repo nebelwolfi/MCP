@@ -1122,7 +1122,7 @@ function Merge-CleanPR {
         }
 
         # Merge directly
-        $mergeOut = gh pr merge $PRNumber --rebase --delete-branch 2>&1
+        $mergeOut = gh pr merge $PRNumber --rebase 2>&1
         $mergeOutStr = "$mergeOut"
         if ($LASTEXITCODE -eq 0) {
             Write-Log "  PR #${PRNumber}: merged" "OK"
@@ -1142,7 +1142,7 @@ function Merge-CleanPR {
 
         # Retry after fetch (base branch may have moved)
         git fetch origin $TargetBranch 2>&1 | Out-Null
-        $mergeOut = gh pr merge $PRNumber --rebase --delete-branch 2>&1
+        $mergeOut = gh pr merge $PRNumber --rebase 2>&1
         $mergeOutStr = "$mergeOut"
         if ($LASTEXITCODE -eq 0) {
             Write-Log "  PR #${PRNumber}: merged (after fetch)" "OK"
@@ -1195,13 +1195,13 @@ function Merge-CleanPR {
                     Write-Log "  PR #${PRNumber}: rebased and pushed" "OK"
                 }
                 finally {
-                    git checkout $TargetBranch 2>&1 | Out-Null
+                    git checkout --detach 2>&1 | Out-Null
                     Pop-Location
                 }
 
                 # Retry merge after rebase
                 Start-Sleep -Seconds 2  # Let GitHub process the push
-                $mergeOut = gh pr merge $PRNumber --rebase --delete-branch 2>&1
+                $mergeOut = gh pr merge $PRNumber --rebase 2>&1
                 $mergeOutStr = "$mergeOut"
                 if ($LASTEXITCODE -eq 0) {
                     Write-Log "  PR #${PRNumber}: merged (after local rebase)" "OK"
@@ -1245,6 +1245,9 @@ function Cleanup-BranchAfterMerge {
     if ($LASTEXITCODE -eq 0) {
         Write-Log "  Cleaned up local branch: $TaskBranch" "OK"
     }
+
+    # Delete the remote branch
+    git -C $MAIN_REPO push origin --delete $TaskBranch 2>&1 | Out-Null
 }
 
 function Get-MergeReviewPrompt {
@@ -1840,7 +1843,6 @@ try {
                         if (Test-BoardComplete) {
                             Write-Log "All tasks are in Done column with complete subtasks" "OK"
                             $boardComplete = $true
-                            break
                         }
                     } else {
                         # Stay on same task — advance to next subtask
@@ -1944,7 +1946,6 @@ try {
                                     if (Test-BoardComplete) {
                                         Write-Log "All tasks are in Done column with complete subtasks" "OK"
                                         $boardComplete = $true
-                                        break
                                     }
                                 }
                             }
@@ -2093,18 +2094,47 @@ try {
         }
     }
 
-    # Stop remaining workers if board is complete
-    if ($boardComplete) {
-        Write-Log "Board complete! Stopping remaining workers..."
-        foreach ($workerId in @($activeJobs.Keys)) {
-            Stop-Job $activeJobs[$workerId].Job -ErrorAction SilentlyContinue
-            Remove-Job $activeJobs[$workerId].Job -Force -ErrorAction SilentlyContinue
+    # Wait for remaining workers to finish gracefully if board is complete
+    if ($boardComplete -and $activeJobs.Count -gt 0) {
+        Write-Log "Board complete — waiting for $($activeJobs.Count) active worker(s) to finish..."
+        while ($activeJobs.Count -gt 0) {
+            Start-Sleep -Seconds 5
+            foreach ($workerId in @($activeJobs.Keys)) {
+                $jobInfo = $activeJobs[$workerId]
+                $job = $jobInfo.Job
+                if ($job.State -eq 'Completed' -or $job.State -eq 'Failed') {
+                    if ($job.State -eq 'Completed') {
+                        $result = Receive-Job $job -ErrorAction SilentlyContinue
+                        Remove-Job $job -Force
+                        $status = if ($result.Status) { $result.Status } else { "UNKNOWN" }
+                        Write-Log "Worker $workerId finished (drain): $status (task: $($jobInfo.TaskId))"
+
+                        # Publish any work from this worker
+                        $taskBranch = "ralph/$($jobInfo.TaskId)"
+                        $hasPublishableChanges = Test-HasNonKanbnChangesInRange -RepoPath $worktrees[$workerId] -RangeSpec "$BaseBranch..$taskBranch"
+                        if ($hasPublishableChanges) {
+                            $published = Publish-WorkerResults `
+                                -WorktreePath $worktrees[$workerId] `
+                                -WorkerId $workerId `
+                                -TaskId $jobInfo.TaskId `
+                                -TargetBranch $BaseBranch
+                            if ($published) {
+                                Write-Log "Worker ${workerId}: pushed branch for $($jobInfo.TaskId)" "OK"
+                            }
+                        }
+                    } else {
+                        Write-Log "Worker $workerId failed (drain): $($jobInfo.TaskId)" "WARN"
+                        Remove-Job $job -Force
+                    }
+                    $activeJobs.Remove($workerId)
+                }
+            }
         }
-        Stop-AllWorkerProcesses
+        Write-Log "All workers finished"
     }
 
     # Phase 3b: Drain any pending ralph PRs before cleanup
-    if (-not $boardComplete -and -not $shutdownRequested) {
+    if (-not $shutdownRequested) {
         $pendingPRs = Get-PendingRalphPRs
         if ($pendingPRs.Count -gt 0) {
             Write-Log ""
