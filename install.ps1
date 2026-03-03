@@ -11,6 +11,13 @@ if (-not $PSScriptRoot -or $PSScriptRoot -eq "") {
         Write-Host "Directory exists, pulling latest..."
         Push-Location $InstallDir
         git fetch origin --quiet
+        $local = git rev-parse HEAD
+        $remote = git rev-parse origin/master
+        if ($local -eq $remote) {
+            Write-Host "Already up to date — no updates available."
+            Pop-Location
+            exit 0
+        }
         git reset --hard origin/master --quiet
         Pop-Location
     } else {
@@ -20,6 +27,10 @@ if (-not $PSScriptRoot -or $PSScriptRoot -eq "") {
 } else {
     $repoRoot = $PSScriptRoot
 }
+
+# Install global dependencies
+Write-Host "Installing kanbn globally..."
+npm install -g @basementuniverse/kanbn --silent
 
 Get-ChildItem -Path $repoRoot -Directory | ForEach-Object {
     $mcpDir = $_.FullName

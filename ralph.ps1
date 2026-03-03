@@ -618,11 +618,14 @@ function Repair-DoneCardsWithIncompleteSubTasks {
 }
 
 function Get-CheckedOutTaskBranches {
-    param([int]$ExcludeWorkerId = 0)
+    param(
+        [int]$ExcludeWorkerId = 0,
+        [hashtable]$Worktrees = @{}
+    )
     $checkedOut = @{}
-    foreach ($w in $worktrees.Keys) {
+    foreach ($w in $Worktrees.Keys) {
         if ($w -eq $ExcludeWorkerId) { continue }
-        $branch = git -C $worktrees[$w] rev-parse --abbrev-ref HEAD 2>$null
+        $branch = git -C $Worktrees[$w] rev-parse --abbrev-ref HEAD 2>$null
         if ($branch -and $branch -match '^ralph/(.+)$') {
             $checkedOut[$Matches[1]] = $w
         }
@@ -631,7 +634,10 @@ function Get-CheckedOutTaskBranches {
 }
 
 function Claim-NextTask {
-    param([int]$WorkerId)
+    param(
+        [int]$WorkerId,
+        [hashtable]$Worktrees = @{}
+    )
 
     $board = Get-BoardJson -RepoPath $MAIN_REPO
     if (-not $board) {
@@ -640,7 +646,7 @@ function Claim-NextTask {
     }
 
     # Check which task branches are already checked out in other worktrees
-    $checkedOutBranches = Get-CheckedOutTaskBranches -ExcludeWorkerId $WorkerId
+    $checkedOutBranches = Get-CheckedOutTaskBranches -ExcludeWorkerId $WorkerId -Worktrees $Worktrees
 
     $inProgressIndex = Get-ColumnIndex -Board $board -ColumnName "In Progress"
     $todoIndex = Get-ColumnIndex -Board $board -ColumnName "Todo"
@@ -1226,16 +1232,19 @@ function Merge-CleanPR {
 }
 
 function Cleanup-BranchAfterMerge {
-    param([string]$TaskBranch)  # e.g. "ralph/foo"
+    param(
+        [string]$TaskBranch,  # e.g. "ralph/foo"
+        [hashtable]$Worktrees = @{}
+    )
 
     # Find if branch is checked out in a worktree
-    foreach ($w in $worktrees.Keys) {
-        $currentBranch = git -C $worktrees[$w] rev-parse --abbrev-ref HEAD 2>$null
+    foreach ($w in $Worktrees.Keys) {
+        $currentBranch = git -C $Worktrees[$w] rev-parse --abbrev-ref HEAD 2>$null
         if ($currentBranch -eq $TaskBranch) {
             # Detach HEAD so the branch can be deleted
             # (can't checkout $BaseBranch - it's already checked out in main repo)
-            git -C $worktrees[$w] checkout -- .kanbn 2>&1 | Out-Null
-            git -C $worktrees[$w] checkout --detach 2>&1 | Out-Null
+            git -C $Worktrees[$w] checkout -- .kanbn 2>&1 | Out-Null
+            git -C $Worktrees[$w] checkout --detach 2>&1 | Out-Null
             break
         }
     }
@@ -1389,8 +1398,40 @@ function Get-PendingRalphPRs {
     }
 }
 
+function Complete-DrainJob {
+    param($DrainJob, [int]$WorkerId, [string]$MergeWorktreePath, [hashtable]$Worktrees = @{})
+
+    $djResult = Receive-Job $DrainJob.Job -ErrorAction SilentlyContinue
+    Remove-Job $DrainJob.Job -Force
+    $djStatus = if ($djResult.Status) { $djResult.Status } else { "UNKNOWN" }
+    $prNum = $DrainJob.PRNumber
+    Write-Log "  Worker $WorkerId merge review PR #${prNum}: $djStatus"
+
+    if ($djStatus -eq "MERGE_REVIEW_DONE") {
+        $prBranch = gh pr view $prNum --json headRefName --jq .headRefName 2>$null
+        $prState = gh pr view $prNum --json state --jq .state 2>$null
+
+        if ($prState -ieq "MERGED") {
+            Write-Log "  PR #${prNum}: already merged by worker, cleaning up" "OK"
+            if ($prBranch) { Cleanup-BranchAfterMerge -TaskBranch $prBranch -Worktrees $Worktrees }
+        } elseif ($prState -ieq "OPEN") {
+            Write-Log "  PR #${prNum}: still open after worker review, retrying merge..."
+            if (Merge-CleanPR -PRNumber $prNum -TargetBranch $BaseBranch -WorktreePath $MergeWorktreePath) {
+                if ($prBranch) { Cleanup-BranchAfterMerge -TaskBranch $prBranch -Worktrees $Worktrees }
+            } else {
+                Write-Log "  PR #${prNum}: merge still failed after worker review" "WARN"
+            }
+        } else {
+            Write-Log "  PR #${prNum}: unexpected state '$prState' after worker review" "WARN"
+        }
+    }
+}
+
 function Invoke-DrainPendingPRs {
-    param([string]$MergeWorktreePath)
+    param(
+        [string]$MergeWorktreePath,
+        [hashtable]$Worktrees = @{}
+    )
 
     $pendingPRs = @(Get-PendingRalphPRs)
     if ($pendingPRs.Count -eq 0) {
@@ -1413,7 +1454,7 @@ function Invoke-DrainPendingPRs {
         # Try direct merge + local rebase first
         Write-Log "  PR #$prNum ($prBranch): attempting merge..."
         if (Merge-CleanPR -PRNumber $prNum -TargetBranch $BaseBranch -WorktreePath $MergeWorktreePath) {
-            Cleanup-BranchAfterMerge -TaskBranch $prBranch
+            Cleanup-BranchAfterMerge -TaskBranch $prBranch -Worktrees $Worktrees
             $drainedPRs[$prNum] = $true
             continue
         }
@@ -1434,10 +1475,7 @@ function Invoke-DrainPendingPRs {
                 foreach ($w in @($drainJobs.Keys)) {
                     $dj = $drainJobs[$w]
                     if ($dj.Job.State -eq 'Completed' -or $dj.Job.State -eq 'Failed') {
-                        $djResult = Receive-Job $dj.Job -ErrorAction SilentlyContinue
-                        Remove-Job $dj.Job -Force
-                        $djStatus = if ($djResult.Status) { $djResult.Status } else { "UNKNOWN" }
-                        Write-Log "  Worker $w merge review PR #$($dj.PRNumber): $djStatus"
+                        Complete-DrainJob -DrainJob $dj -WorkerId $w -MergeWorktreePath $MergeWorktreePath -Worktrees $Worktrees
                         $drainJobs.Remove($w)
                         $pickWorker = $w
                         break
@@ -1466,16 +1504,13 @@ function Invoke-DrainPendingPRs {
         foreach ($w in @($drainJobs.Keys)) {
             $dj = $drainJobs[$w]
             if ($dj.Job.State -eq 'Completed' -or $dj.Job.State -eq 'Failed') {
-                $djResult = Receive-Job $dj.Job -ErrorAction SilentlyContinue
-                Remove-Job $dj.Job -Force
-                $djStatus = if ($djResult.Status) { $djResult.Status } else { "UNKNOWN" }
-                Write-Log "  Worker $w merge review PR #$($dj.PRNumber): $djStatus"
+                Complete-DrainJob -DrainJob $dj -WorkerId $w -MergeWorktreePath $MergeWorktreePath -Worktrees $Worktrees
                 $drainJobs.Remove($w)
             }
         }
     }
 
-    Write-Log "Merge-only complete" "OK"
+    Write-Log "Drain complete" "OK"
 }
 
 # ============================================================
@@ -1612,7 +1647,7 @@ if ($MergeOnly) {
 
 # Validate
 if ($Workers -lt 1) {
-    Write-Host "Usage: ralph-parallel.ps1 [-Workers N] [-IterationsPerWorker N] [-BaseBranch branch]"
+    Write-Host "Usage: Ralph-Loop [-Workers N] [-IterationsPerWorker N] [-BaseBranch branch]"
     return
 }
 
@@ -1694,7 +1729,7 @@ try {
     Write-Log ""
     Write-Log "Phase 2: Dispatching workers..."
     foreach ($w in $worktrees.Keys) {
-        $claim = Claim-NextTask -WorkerId $w
+        $claim = Claim-NextTask -WorkerId $w -Worktrees $worktrees
         if (-not $claim) {
             Write-Log "No tasks available for worker $w" "WARN"
             continue
@@ -2006,7 +2041,7 @@ try {
                             foreach ($pr in $pendingPRs) {
                                 Write-Log "Worker ${workerId}: attempting merge of PR #$($pr.number) ($($pr.headRefName))..."
                                 if (Merge-CleanPR -PRNumber $pr.number -TargetBranch $BaseBranch -WorktreePath $mergeWorktreePath) {
-                                    Cleanup-BranchAfterMerge -TaskBranch $pr.headRefName
+                                    Cleanup-BranchAfterMerge -TaskBranch $pr.headRefName -Worktrees $worktrees
                                 }
                                 # If merge fails, Phase 3b will handle conflict resolution
                             }
@@ -2015,7 +2050,7 @@ try {
 
                     # Priority 2: Claim next kanbn task
                     if (-not $dispatched) {
-                        $nextClaim = Claim-NextTask -WorkerId $workerId
+                        $nextClaim = Claim-NextTask -WorkerId $workerId -Worktrees $worktrees
                         if ($nextClaim) {
                             $nextTask = $nextClaim.TaskId
                             $nextSubTask = $nextClaim.ClaimedSubTask
@@ -2096,7 +2131,7 @@ try {
 
     # Wait for remaining workers to finish gracefully if board is complete
     if ($boardComplete -and $activeJobs.Count -gt 0) {
-        Write-Log "Board complete — waiting for $($activeJobs.Count) active worker(s) to finish..."
+        Write-Log "Board complete -- waiting for $($activeJobs.Count) active worker(s) to finish..."
         while ($activeJobs.Count -gt 0) {
             Start-Sleep -Seconds 5
             foreach ($workerId in @($activeJobs.Keys)) {
@@ -2135,97 +2170,9 @@ try {
 
     # Phase 3b: Drain any pending ralph PRs before cleanup
     if (-not $shutdownRequested) {
-        $pendingPRs = Get-PendingRalphPRs
-        if ($pendingPRs.Count -gt 0) {
-            Write-Log ""
-            Write-Log "Phase 3b: Draining $($pendingPRs.Count) pending PR(s)..."
-
-            # Cap to 1 concurrent merge-review worker
-            $availableWorkers = @(1)
-            if ($availableWorkers.Count -gt 0) {
-                $drainJobs = @{}
-                $drainedPRs = @{}
-
-                foreach ($pr in $pendingPRs) {
-                    $prNum = $pr.number
-                    $prBranch = $pr.headRefName
-
-                    if ($drainedPRs.ContainsKey($prNum)) { continue }
-
-                    # Try direct merge + local rebase first
-                    Write-Log "  PR #$prNum ($prBranch): attempting merge..."
-                    if (Merge-CleanPR -PRNumber $prNum -TargetBranch $BaseBranch -WorktreePath $mergeWorktreePath) {
-                        Cleanup-BranchAfterMerge -TaskBranch $prBranch
-                        $drainedPRs[$prNum] = $true
-                        continue
-                    }
-
-                    # Fall back to worker for conflict resolution
-                    $pickWorker = $null
-                    foreach ($w in $availableWorkers) {
-                        if (-not $drainJobs.ContainsKey($w)) {
-                            $pickWorker = $w
-                            break
-                        }
-                    }
-
-                    # If all workers busy, wait for one to finish before dispatching more
-                    if (-not $pickWorker) {
-                        while (-not $pickWorker) {
-                            Start-Sleep -Seconds 5
-                            foreach ($w in @($drainJobs.Keys)) {
-                                $dj = $drainJobs[$w]
-                                if ($dj.Job.State -eq 'Completed' -or $dj.Job.State -eq 'Failed') {
-                                    $djResult = Receive-Job $dj.Job -ErrorAction SilentlyContinue
-                                    Remove-Job $dj.Job -Force
-                                    $djStatus = if ($djResult.Status) { $djResult.Status } else { "UNKNOWN" }
-                                    Write-Log "  Worker $w drain merge review PR #$($dj.PRNumber): $djStatus"
-                                    if ($djStatus -eq "MERGE_REVIEW_DONE") {
-                        
-                                    }
-                                    $drainJobs.Remove($w)
-                                    $pickWorker = $w
-                                    break
-                                }
-                            }
-                        }
-                    }
-
-                    $logFile = "$LOG_DIR/worker-$pickWorker.log"
-                    Write-Log "  Worker $pickWorker dispatched on drain merge review: PR #$prNum ($prBranch)"
-                    $job = Start-MergeReviewWorker `
-                        -WorkerId $pickWorker `
-                        -PRNumber $prNum `
-                        -TaskBranch $prBranch `
-                        -TargetBranch $BaseBranch `
-                        -LogFile $logFile `
-                        -WorktreePath $mergeWorktreePath
-
-                    $drainJobs[$pickWorker] = @{ Job = $job; PRNumber = $prNum }
-                    $drainedPRs[$prNum] = $true
-                }
-
-                # Wait for remaining drain jobs to complete
-                while ($drainJobs.Count -gt 0) {
-                    Start-Sleep -Seconds 10
-                    foreach ($w in @($drainJobs.Keys)) {
-                        $dj = $drainJobs[$w]
-                        if ($dj.Job.State -eq 'Completed' -or $dj.Job.State -eq 'Failed') {
-                            $djResult = Receive-Job $dj.Job -ErrorAction SilentlyContinue
-                            Remove-Job $dj.Job -Force
-                            $djStatus = if ($djResult.Status) { $djResult.Status } else { "UNKNOWN" }
-                            Write-Log "  Worker $w drain merge review PR #$($dj.PRNumber): $djStatus"
-                            if ($djStatus -eq "MERGE_REVIEW_DONE") {
-                
-                            }
-                            $drainJobs.Remove($w)
-                        }
-                    }
-                }
-
-                Write-Log "Phase 3b complete" "OK"
-            }
-        }
+        Write-Log ""
+        Write-Log "Phase 3b: Draining pending PRs..."
+        Invoke-DrainPendingPRs -MergeWorktreePath $mergeWorktreePath -Worktrees $worktrees
     }
 }
 finally {
