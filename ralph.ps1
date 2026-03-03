@@ -617,8 +617,10 @@ function Repair-DoneCardsWithIncompleteSubTasks {
 }
 
 function Get-CheckedOutTaskBranches {
+    param([int]$ExcludeWorkerId = 0)
     $checkedOut = @{}
     foreach ($w in $worktrees.Keys) {
+        if ($w -eq $ExcludeWorkerId) { continue }
         $branch = git -C $worktrees[$w] rev-parse --abbrev-ref HEAD 2>$null
         if ($branch -and $branch -match '^ralph/(.+)$') {
             $checkedOut[$Matches[1]] = $w
@@ -637,7 +639,7 @@ function Claim-NextTask {
     }
 
     # Check which task branches are already checked out in other worktrees
-    $checkedOutBranches = Get-CheckedOutTaskBranches
+    $checkedOutBranches = Get-CheckedOutTaskBranches -ExcludeWorkerId $WorkerId
 
     $inProgressIndex = Get-ColumnIndex -Board $board -ColumnName "In Progress"
     $todoIndex = Get-ColumnIndex -Board $board -ColumnName "Todo"
@@ -1832,26 +1834,46 @@ try {
                         $mainTask = Get-TaskJson -RepoPath $MAIN_REPO -TaskId $jobInfo.TaskId
                         $allSubTasksComplete = Test-AllSubTasksComplete -Task $mainTask
 
-                        Push-Location $MAIN_REPO
-                        try {
-                            if ($allSubTasksComplete) {
+                        if ($allSubTasksComplete) {
+                            Push-Location $MAIN_REPO
+                            try {
                                 kanbn move $jobInfo.TaskId -c "Done" 2>$null | Out-Null
                                 New-TaskPR -TaskId $jobInfo.TaskId
-                            } else {
-                                kanbn move $jobInfo.TaskId -c "In Progress" 2>$null | Out-Null
-                                Write-Log "Task $($jobInfo.TaskId) moved back to In Progress (incomplete subtasks)" "WARN"
                             }
-                        }
-                        finally {
-                            Pop-Location
-                        }
+                            finally {
+                                Pop-Location
+                            }
+                            Release-TaskClaim -TaskId $jobInfo.TaskId
 
-                        Release-TaskClaim -TaskId $jobInfo.TaskId
-
-                        if ($allSubTasksComplete -and (Test-BoardComplete)) {
-                            Write-Log "All tasks are in Done column with complete subtasks" "OK"
-                            $boardComplete = $true
-                            break
+                            if (Test-BoardComplete) {
+                                Write-Log "All tasks are in Done column with complete subtasks" "OK"
+                                $boardComplete = $true
+                                break
+                            }
+                        } else {
+                            # Stay on same task — advance to next subtask
+                            $nextSub = Get-FirstIncompleteSubTask -Task $mainTask
+                            if ($nextSub) {
+                                $script:claimedSubTasks[$jobInfo.TaskId] = $nextSub
+                                Write-Log "Worker $workerId advancing to next subtask: $nextSub"
+                                Sync-KanbnToWorktree -WorktreePath $worktrees[$workerId]
+                                $logFile = "$LOG_DIR/worker-$workerId.log"
+                                $newJob = Start-Worker -WorkerId $workerId -WorktreePath $worktrees[$workerId] `
+                                    -TaskId $jobInfo.TaskId -ClaimedSubTask $nextSub -LogFile $logFile -BaseBranchName $BaseBranch
+                                $activeJobs[$workerId] = @{ Job = $newJob; TaskId = $jobInfo.TaskId; ClaimedSubTask = $nextSub }
+                                $dispatched = $true
+                            } else {
+                                # Edge case: no subtasks left but Test-AllSubTasksComplete disagreed
+                                Push-Location $MAIN_REPO
+                                try {
+                                    kanbn move $jobInfo.TaskId -c "Done" 2>$null | Out-Null
+                                    New-TaskPR -TaskId $jobInfo.TaskId
+                                }
+                                finally {
+                                    Pop-Location
+                                }
+                                Release-TaskClaim -TaskId $jobInfo.TaskId
+                            }
                         }
                     }
                     elseif ($status -eq "ERROR") {
