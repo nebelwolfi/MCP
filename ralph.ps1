@@ -40,6 +40,7 @@ $SUBMODULES = git -C $MAIN_REPO config --file .gitmodules --get-regexp '^submodu
 # Track claimed tasks for cleanup
 $script:claimedTasks = @{}
 $script:claimedSubTasks = @{}
+$script:completedTasks = @{}
 
 # ============================================================
 # Logging
@@ -654,6 +655,7 @@ function Claim-NextTask {
                 $taskId = Get-TaskId -Task $task
                 if (-not $taskId) { continue }
                 if ($script:claimedTasks.ContainsKey($taskId)) { continue }
+                if ($script:completedTasks.ContainsKey($taskId)) { continue }
                 if ($checkedOutBranches.ContainsKey($taskId)) { continue }
 
                 $taskObj = if ($task.PSObject.Properties["subTasks"]) { $task } else { Get-TaskJson -RepoPath $MAIN_REPO -TaskId $taskId }
@@ -1257,15 +1259,21 @@ You are resolving merge conflicts and merging a pull request.
 
 PR #$PRNumber (branch: $TaskBranch -> $TargetBranch)
 
+IMPORTANT CONSTRAINTS:
+- Do NOT run ``gh pr checkout`` (it fails when the branch is checked out in another worktree)
+- Do NOT run ``git checkout $TargetBranch`` (it is checked out in the main repo and will fail)
+- Do NOT navigate to any other directory — stay in the current working directory
+- Use detached HEAD mode for all operations
+
 Steps:
-1. Check out the PR branch locally:
+1. Fetch and check out the PR branch in detached HEAD mode:
 ``````bash
-gh pr checkout $PRNumber
+git fetch origin $TaskBranch $TargetBranch
+git checkout origin/$TaskBranch --detach
 ``````
 
-2. Fetch and rebase onto the target:
+2. Rebase onto the target:
 ``````bash
-git fetch origin $TargetBranch
 git rebase origin/$TargetBranch
 ``````
 
@@ -1291,20 +1299,14 @@ cmake --build cmake-build-debug --target tests && cmake-build-debug/git/tests/te
 git push origin HEAD:$TaskBranch --force
 ``````
 
-7. Switch back to $TargetBranch before merging:
+7. Merge the PR:
 ``````bash
-git checkout $TargetBranch
+gh pr merge $PRNumber --rebase
 ``````
 
-8. Merge the PR:
-``````bash
-gh pr merge $PRNumber --rebase --delete-branch
-``````
-
-If you cannot resolve the conflicts cleanly, first abort and switch back:
+If you cannot resolve the conflicts cleanly, abort:
 ``````bash
 git rebase --abort
-git checkout $TargetBranch
 ``````
 Then leave a comment explaining the issue:
 ``````bash
@@ -1357,11 +1359,8 @@ function Start-MergeReviewWorker {
             return @{ Status = $status; WorkerId = $WorkerId; PRNumber = $PRNumber }
         }
         finally {
-            # Restore worktree to base branch (merge review may have checked out PR branch)
-            $cur = git rev-parse --abbrev-ref HEAD 2>$null
-            if ($cur -and $cur -ne $BaseBranch) {
-                git checkout $BaseBranch 2>&1 | Out-Null
-            }
+            # Detach HEAD to release any branch lock (don't checkout $BaseBranch — it's in MAIN_REPO)
+            git checkout --detach 2>&1 | Out-Null
         }
     }
 
@@ -1748,6 +1747,13 @@ try {
         }
         if ($shutdownRequested) { break }
 
+        # Guard: ensure MAIN_REPO stays on the correct branch (merge workers can corrupt this)
+        $currentMain = git -C $MAIN_REPO rev-parse --abbrev-ref HEAD 2>$null
+        if ($currentMain -and $currentMain -ne $BaseBranch) {
+            Write-Log "MAIN_REPO on '$currentMain' instead of '$BaseBranch', restoring!" "ERROR"
+            git -C $MAIN_REPO checkout $BaseBranch 2>&1 | Out-Null
+        }
+
         foreach ($workerId in @($activeJobs.Keys)) {
             $jobInfo = $activeJobs[$workerId]
             $job = $jobInfo.Job
@@ -1759,139 +1765,125 @@ try {
                 $status = if ($result.Status) { $result.Status } else { "UNKNOWN" }
                 Write-Log "Worker $workerId finished: $status (task: $($jobInfo.TaskId))"
 
-                # Handle merge-review results - skip kanbn publish/task logic
-                if ($status -eq "MERGE_REVIEW_DONE" -or $status -eq "MERGE_REVIEW_ERROR") {
-                    $prNum = if ($jobInfo.ContainsKey("PRNumber")) { $jobInfo.PRNumber } else { "?" }
-                    if ($status -eq "MERGE_REVIEW_DONE") {
-                        Write-Log "Worker $workerId completed merge review for PR #$prNum" "OK"
-                        # Clean up local branches whose remote was deleted after merge
-        
-                    } else {
-                        Write-Log "Worker $workerId merge review failed for PR #$prNum" "WARN"
-                    }
-                    $totalIterations++
-                    $totalCompleted++
-                    Write-Log "Worker ${workerId}: iteration $totalIterations / $maxIterations (budget)"
+                # Task completion - publish + kanbn handling
+                $claimedSubTask = if ($jobInfo.ContainsKey("ClaimedSubTask")) { $jobInfo.ClaimedSubTask } else { $null }
+                $workerTaskSnapshot = $null
+                $workerColumnSnapshot = $null
+                if ($status -eq "TASK_COMPLETE") {
+                    # Capture worker-side task state before publish logic potentially strips .kanbn edits.
+                    $workerTaskSnapshot = Get-TaskJson -RepoPath $worktrees[$workerId] -TaskId $jobInfo.TaskId
+                    $workerColumnSnapshot = Get-TaskColumn -RepoPath $worktrees[$workerId] -TaskId $jobInfo.TaskId
                 }
-                else {
-                    # Regular task completion - publish + kanbn handling
-                    $claimedSubTask = if ($jobInfo.ContainsKey("ClaimedSubTask")) { $jobInfo.ClaimedSubTask } else { $null }
-                    $workerTaskSnapshot = $null
-                    $workerColumnSnapshot = $null
-                    if ($status -eq "TASK_COMPLETE") {
-                        # Capture worker-side task state before publish logic potentially strips .kanbn edits.
-                        $workerTaskSnapshot = Get-TaskJson -RepoPath $worktrees[$workerId] -TaskId $jobInfo.TaskId
-                        $workerColumnSnapshot = Get-TaskColumn -RepoPath $worktrees[$workerId] -TaskId $jobInfo.TaskId
+
+                # Publish if there are any non-.kanbn changes (regardless of status).
+                $taskBranch = "ralph/$($jobInfo.TaskId)"
+                $hasPublishableChanges = Test-HasNonKanbnChangesInRange -RepoPath $worktrees[$workerId] -RangeSpec "$BaseBranch..$taskBranch"
+                if ($hasPublishableChanges) {
+                    $published = Publish-WorkerResults `
+                        -WorktreePath $worktrees[$workerId] `
+                        -WorkerId $workerId `
+                        -TaskId $jobInfo.TaskId `
+                        -TargetBranch $BaseBranch
+
+                    if ($published) {
+                        Write-Log "Worker ${workerId}: pushed branch for $($jobInfo.TaskId)" "OK"
+                    } else {
+                        Write-Log "Worker ${workerId}: publish failed for $($jobInfo.TaskId)" "ERROR"
                     }
+                }
 
-                    # Publish if there are any non-.kanbn changes (regardless of status).
-                    $taskBranch = "ralph/$($jobInfo.TaskId)"
-                    $hasPublishableChanges = Test-HasNonKanbnChangesInRange -RepoPath $worktrees[$workerId] -RangeSpec "$BaseBranch..$taskBranch"
-                    if ($hasPublishableChanges) {
-                        $published = Publish-WorkerResults `
-                            -WorktreePath $worktrees[$workerId] `
-                            -WorkerId $workerId `
-                            -TaskId $jobInfo.TaskId `
-                            -TargetBranch $BaseBranch
+                $totalIterations++
+                $totalCompleted++
+                Write-Log "Worker ${workerId}: iteration $totalIterations / $maxIterations (budget)"
 
-                        if ($published) {
-                            Write-Log "Worker ${workerId}: pushed branch for $($jobInfo.TaskId)" "OK"
+                if ($status -eq "TASK_COMPLETE") {
+                    $workerTask = $workerTaskSnapshot
+                    $workerColumn = $workerColumnSnapshot
+                    $workerMovedTaskToDone = ($workerColumn -ieq "Done")
+                    $workerCheckedClaimedSubTask = Test-SubTaskComplete -Task $workerTask -SubTaskText $claimedSubTask
+
+                    if ($claimedSubTask -and ($workerCheckedClaimedSubTask -or $workerMovedTaskToDone)) {
+                        if (Complete-SubTaskInRepo -RepoPath $MAIN_REPO -TaskId $jobInfo.TaskId -SubTaskText $claimedSubTask) {
+                            if ($workerCheckedClaimedSubTask) {
+                                Write-Log "Synced completed subtask from worker: $claimedSubTask" "OK"
+                            } else {
+                                Write-Log "Worker moved $($jobInfo.TaskId) to Done; assuming claimed subtask complete: $claimedSubTask" "WARN"
+                            }
                         } else {
-                            Write-Log "Worker ${workerId}: publish failed for $($jobInfo.TaskId)" "ERROR"
+                            Write-Log "Failed to sync claimed subtask to main board: $claimedSubTask" "WARN"
+                        }
+                    } elseif ($claimedSubTask) {
+                        # Worker completed code but didn't check off kanbn subtask - force-mark it
+                        # to prevent infinite re-assignment of already-done work
+                        if (Complete-SubTaskInRepo -RepoPath $MAIN_REPO -TaskId $jobInfo.TaskId -SubTaskText $claimedSubTask) {
+                            Write-Log "Force-marked subtask complete (worker had TASK_COMPLETE but didn't check it off): $claimedSubTask" "WARN"
+                        } else {
+                            Write-Log "Failed to force-mark subtask; may loop: $claimedSubTask" "ERROR"
                         }
                     }
 
-                    $totalIterations++
-                    $totalCompleted++
-                    Write-Log "Worker ${workerId}: iteration $totalIterations / $maxIterations (budget)"
+                    $mainTask = Get-TaskJson -RepoPath $MAIN_REPO -TaskId $jobInfo.TaskId
+                    $allSubTasksComplete = Test-AllSubTasksComplete -Task $mainTask
 
-                    if ($status -eq "TASK_COMPLETE") {
-                        $workerTask = $workerTaskSnapshot
-                        $workerColumn = $workerColumnSnapshot
-                        $workerMovedTaskToDone = ($workerColumn -ieq "Done")
-                        $workerCheckedClaimedSubTask = Test-SubTaskComplete -Task $workerTask -SubTaskText $claimedSubTask
-
-                        if ($claimedSubTask -and ($workerCheckedClaimedSubTask -or $workerMovedTaskToDone)) {
-                            if (Complete-SubTaskInRepo -RepoPath $MAIN_REPO -TaskId $jobInfo.TaskId -SubTaskText $claimedSubTask) {
-                                if ($workerCheckedClaimedSubTask) {
-                                    Write-Log "Synced completed subtask from worker: $claimedSubTask" "OK"
-                                } else {
-                                    Write-Log "Worker moved $($jobInfo.TaskId) to Done; assuming claimed subtask complete: $claimedSubTask" "WARN"
-                                }
-                            } else {
-                                Write-Log "Failed to sync claimed subtask to main board: $claimedSubTask" "WARN"
-                            }
-                        } elseif ($claimedSubTask) {
-                            # Worker completed code but didn't check off kanbn subtask - force-mark it
-                            # to prevent infinite re-assignment of already-done work
-                            if (Complete-SubTaskInRepo -RepoPath $MAIN_REPO -TaskId $jobInfo.TaskId -SubTaskText $claimedSubTask) {
-                                Write-Log "Force-marked subtask complete (worker had TASK_COMPLETE but didn't check it off): $claimedSubTask" "WARN"
-                            } else {
-                                Write-Log "Failed to force-mark subtask; may loop: $claimedSubTask" "ERROR"
-                            }
+                    if ($allSubTasksComplete) {
+                        Push-Location $MAIN_REPO
+                        try {
+                            kanbn move $jobInfo.TaskId -c "Done" 2>$null | Out-Null
+                            $script:completedTasks[$jobInfo.TaskId] = $true
+                            New-TaskPR -TaskId $jobInfo.TaskId
                         }
+                        finally {
+                            Pop-Location
+                        }
+                        Release-TaskClaim -TaskId $jobInfo.TaskId
 
-                        $mainTask = Get-TaskJson -RepoPath $MAIN_REPO -TaskId $jobInfo.TaskId
-                        $allSubTasksComplete = Test-AllSubTasksComplete -Task $mainTask
-
-                        if ($allSubTasksComplete) {
+                        if (Test-BoardComplete) {
+                            Write-Log "All tasks are in Done column with complete subtasks" "OK"
+                            $boardComplete = $true
+                            break
+                        }
+                    } else {
+                        # Stay on same task — advance to next subtask
+                        $nextSub = Get-FirstIncompleteSubTask -Task $mainTask
+                        if ($nextSub) {
+                            $script:claimedSubTasks[$jobInfo.TaskId] = $nextSub
+                            Write-Log "Worker $workerId advancing to next subtask: $nextSub"
+                            Sync-KanbnToWorktree -WorktreePath $worktrees[$workerId]
+                            $logFile = "$LOG_DIR/worker-$workerId.log"
+                            $newJob = Start-Worker -WorkerId $workerId -WorktreePath $worktrees[$workerId] `
+                                -TaskId $jobInfo.TaskId -ClaimedSubTask $nextSub -LogFile $logFile -BaseBranchName $BaseBranch
+                            $activeJobs[$workerId] = @{ Job = $newJob; TaskId = $jobInfo.TaskId; ClaimedSubTask = $nextSub }
+                            continue
+                        } else {
+                            # Edge case: no subtasks left but Test-AllSubTasksComplete disagreed
                             Push-Location $MAIN_REPO
                             try {
                                 kanbn move $jobInfo.TaskId -c "Done" 2>$null | Out-Null
+                                $script:completedTasks[$jobInfo.TaskId] = $true
                                 New-TaskPR -TaskId $jobInfo.TaskId
                             }
                             finally {
                                 Pop-Location
                             }
                             Release-TaskClaim -TaskId $jobInfo.TaskId
-
-                            if (Test-BoardComplete) {
-                                Write-Log "All tasks are in Done column with complete subtasks" "OK"
-                                $boardComplete = $true
-                                break
-                            }
-                        } else {
-                            # Stay on same task — advance to next subtask
-                            $nextSub = Get-FirstIncompleteSubTask -Task $mainTask
-                            if ($nextSub) {
-                                $script:claimedSubTasks[$jobInfo.TaskId] = $nextSub
-                                Write-Log "Worker $workerId advancing to next subtask: $nextSub"
-                                Sync-KanbnToWorktree -WorktreePath $worktrees[$workerId]
-                                $logFile = "$LOG_DIR/worker-$workerId.log"
-                                $newJob = Start-Worker -WorkerId $workerId -WorktreePath $worktrees[$workerId] `
-                                    -TaskId $jobInfo.TaskId -ClaimedSubTask $nextSub -LogFile $logFile -BaseBranchName $BaseBranch
-                                $activeJobs[$workerId] = @{ Job = $newJob; TaskId = $jobInfo.TaskId; ClaimedSubTask = $nextSub }
-                                continue
-                            } else {
-                                # Edge case: no subtasks left but Test-AllSubTasksComplete disagreed
-                                Push-Location $MAIN_REPO
-                                try {
-                                    kanbn move $jobInfo.TaskId -c "Done" 2>$null | Out-Null
-                                    New-TaskPR -TaskId $jobInfo.TaskId
-                                }
-                                finally {
-                                    Pop-Location
-                                }
-                                Release-TaskClaim -TaskId $jobInfo.TaskId
-                            }
                         }
-                    }
-                    elseif ($status -eq "ERROR") {
-                        Push-Location $MAIN_REPO
-                        try {
-                            kanbn move $jobInfo.TaskId -c "Todo" 2>$null | Out-Null
-                        }
-                        finally {
-                            Pop-Location
-                        }
-                        Release-TaskClaim -TaskId $jobInfo.TaskId
-                        Write-Log "Task $($jobInfo.TaskId) errored" "WARN"
-                    } elseif ($status -ne "NO_COMMITS") {
-                        Release-TaskClaim -TaskId $jobInfo.TaskId
                     }
                 }
+                elseif ($status -eq "ERROR") {
+                    Push-Location $MAIN_REPO
+                    try {
+                        kanbn move $jobInfo.TaskId -c "Todo" 2>$null | Out-Null
+                    }
+                    finally {
+                        Pop-Location
+                    }
+                    Release-TaskClaim -TaskId $jobInfo.TaskId
+                    Write-Log "Task $($jobInfo.TaskId) errored" "WARN"
+                } elseif ($status -ne "NO_COMMITS") {
+                    Release-TaskClaim -TaskId $jobInfo.TaskId
+                }
 
-                # Decide next work: merge review (priority) > same task (NO_COMMITS) > new kanbn task
+                # Decide next work: same task (NO_COMMITS) > new kanbn task
                 if (-not $boardComplete -and $totalIterations -lt $maxIterations) {
                     $dispatched = $false
 
@@ -1942,6 +1934,7 @@ try {
                                     Push-Location $MAIN_REPO
                                     try {
                                         kanbn move $jobInfo.TaskId -c "Done" 2>$null | Out-Null
+                                        $script:completedTasks[$jobInfo.TaskId] = $true
                                         New-TaskPR -TaskId $jobInfo.TaskId
                                     }
                                     finally { Pop-Location }
@@ -2001,74 +1994,20 @@ try {
                         }
                     }
 
-                    # Priority 1: Check for pending ralph PRs that need merge review
+                    # Priority 1: Try instant merge of pending PRs (no worker dispatch — conflict resolution deferred to Phase 3b)
                     if (-not $dispatched) {
                         # Reset NO_COMMITS counter on success
                         $ncKey = "$($jobInfo.TaskId)::$($jobInfo.ClaimedSubTask)"
                         if ($noCommitCounts.ContainsKey($ncKey)) { $noCommitCounts.Remove($ncKey) }
 
-                        # Cap to 1 concurrent merge-review worker
-                        $mergeReviewActive = (-not $mergeWorktreePath)
-                        foreach ($aj in $activeJobs.Values) {
-                            if ($aj.ContainsKey("PRNumber")) {
-                                $mergeReviewActive = $true
-                                break
-                            }
-                        }
-
-                        $pendingPRs = if (-not $mergeReviewActive) { Get-PendingRalphPRs } else { @() }
-                        $mergeTarget = $null
-                        foreach ($pr in $pendingPRs) {
-                            $prNum = $pr.number
-                            $prBranch = $pr.headRefName
-
-                            # Skip PRs already being reviewed by another worker
-                            $alreadyClaimed = $false
-                            foreach ($aj in $activeJobs.Values) {
-                                if ($aj.ContainsKey("PRNumber") -and $aj.PRNumber -eq $prNum) {
-                                    $alreadyClaimed = $true
-                                    break
+                        if ($mergeWorktreePath) {
+                            $pendingPRs = Get-PendingRalphPRs
+                            foreach ($pr in $pendingPRs) {
+                                Write-Log "Worker ${workerId}: attempting merge of PR #$($pr.number) ($($pr.headRefName))..."
+                                if (Merge-CleanPR -PRNumber $pr.number -TargetBranch $BaseBranch -WorktreePath $mergeWorktreePath) {
+                                    Cleanup-BranchAfterMerge -TaskBranch $pr.headRefName
                                 }
-                            }
-                            if ($alreadyClaimed) { continue }
-
-                            # Skip PRs this worker just finished reviewing (may still show as open briefly)
-                            $justReviewedBranch = if ($jobInfo.ContainsKey("TaskBranch")) { $jobInfo.TaskBranch } else { $null }
-                            if ($justReviewedBranch -and $prBranch -eq $justReviewedBranch) { continue }
-
-                            $mergeTarget = @{
-                                PRNumber = $prNum
-                                TaskBranch = $prBranch
-                            }
-                            break
-                        }
-
-                        if ($mergeTarget) {
-                            # Try direct merge + local rebase first
-                            Write-Log "Worker ${workerId}: attempting merge of PR #$($mergeTarget.PRNumber) ($($mergeTarget.TaskBranch))..."
-                            if (Merge-CleanPR -PRNumber $mergeTarget.PRNumber -TargetBranch $BaseBranch -WorktreePath $mergeWorktreePath) {
-                                Cleanup-BranchAfterMerge -TaskBranch $mergeTarget.TaskBranch
-                                # Don't set $dispatched — let this worker try Priority 2 (claim next task)
-                            } else {
-                                # Fall back to worker for conflict resolution
-                                $logFile = "$LOG_DIR/worker-$workerId.log"
-                                Write-Log "Worker $workerId dispatched on merge review: PR #$($mergeTarget.PRNumber) ($($mergeTarget.TaskBranch))"
-
-                                $newJob = Start-MergeReviewWorker `
-                                    -WorkerId $workerId `
-                                    -PRNumber $mergeTarget.PRNumber `
-                                    -TaskBranch $mergeTarget.TaskBranch `
-                                    -TargetBranch $BaseBranch `
-                                    -LogFile $logFile `
-                                    -WorktreePath $mergeWorktreePath
-
-                                $activeJobs[$workerId] = @{
-                                    Job = $newJob
-                                    TaskId = "merge-review"
-                                    PRNumber = $mergeTarget.PRNumber
-                                    TaskBranch = $mergeTarget.TaskBranch
-                                }
-                                $dispatched = $true
+                                # If merge fails, Phase 3b will handle conflict resolution
                             }
                         }
                     }
