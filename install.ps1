@@ -87,7 +87,7 @@ if (Test-Path $ralphScript) {
 }
 
 # Register Kanban-Open globally via PowerShell profile
-$webEntry = Join-Path $repoRoot "kanban-mcp" "dist" "web.js"
+$webEntry = Join-Path (Join-Path (Join-Path $repoRoot "kanban-mcp") "dist") "web.js"
 if (Test-Path $webEntry) {
     $funcDef = "function Kanban-Open { node `"$webEntry`" @args }"
     $profileContent = if (Test-Path $PROFILE) { Get-Content $PROFILE -Raw } else { "" }
