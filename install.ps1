@@ -29,8 +29,12 @@ if (-not $PSScriptRoot -or $PSScriptRoot -eq "") {
 }
 
 # Install global dependencies
-Write-Host "Installing kanbn globally..."
-npm install -g @basementuniverse/kanbn --silent
+if (-not (Get-Command kanbn -ErrorAction SilentlyContinue)) {
+    Write-Host "Installing kanbn globally..."
+    npm install -g @basementuniverse/kanbn --silent
+} else {
+    Write-Host "kanbn already installed, skipping."
+}
 
 Get-ChildItem -Path $repoRoot -Directory | ForEach-Object {
     $mcpDir = $_.FullName
