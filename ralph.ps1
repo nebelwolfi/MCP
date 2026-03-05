@@ -649,15 +649,29 @@ function Claim-NextTask {
         return $null
     }
 
-    # Check which task branches are already checked out in other worktrees
     $checkedOutBranches = Get-CheckedOutTaskBranches -ExcludeWorkerId $WorkerId -Worktrees $Worktrees
 
     $inProgressIndex = Get-ColumnIndex -Board $board -ColumnName "In Progress"
     $todoIndex = Get-ColumnIndex -Board $board -ColumnName "Todo"
     $backlogIndex = Get-ColumnIndex -Board $board -ColumnName "Backlog"
+    $doneIndex = Get-ColumnIndex -Board $board -ColumnName "Done"
 
+    $doneTasks = @{}
+    if ($doneIndex -ge 0) {
+        foreach ($lane in $board.lanes) {
+            if ($doneIndex -ge $lane.columns.Count) { continue }
+            foreach ($t in (Get-ColumnTaskItems -ColumnTasks $lane.columns[$doneIndex])) {
+                $tid = Get-TaskId -Task $t
+                if ($tid) { $doneTasks[$tid] = $true }
+            }
+        }
+    }
+    foreach ($tid in $script:completedTasks.Keys) { $doneTasks[$tid] = $true }
+
+    $candidates = [System.Collections.ArrayList]::new()
+    $columnRank = 0
     foreach ($targetColumn in @($inProgressIndex, $todoIndex, $backlogIndex)) {
-        if ($targetColumn -lt 0) { continue }
+        if ($targetColumn -lt 0) { $columnRank++; continue }
 
         foreach ($lane in $board.lanes) {
             if ($targetColumn -ge $lane.columns.Count) { continue }
@@ -668,35 +682,85 @@ function Claim-NextTask {
                 if ($script:completedTasks.ContainsKey($taskId)) { continue }
                 if ($checkedOutBranches.ContainsKey($taskId)) { continue }
 
-                $taskObj = if ($task.PSObject.Properties["subTasks"]) { $task } else { Get-TaskJson -RepoPath $MAIN_REPO -TaskId $taskId }
-                $claimedSubTask = Get-FirstIncompleteSubTask -Task $taskObj
+                $taskObj = if ($task.PSObject.Properties["relations"]) { $task } else { Get-TaskJson -RepoPath $MAIN_REPO -TaskId $taskId }
 
-                Push-Location $MAIN_REPO
-                try {
-                    kanbn move $taskId -c "In Progress" 2>$null | Out-Null
-                }
-                finally {
-                    Pop-Location
-                }
-
-                $script:claimedTasks[$taskId] = $WorkerId
-                if ($claimedSubTask) {
-                    $script:claimedSubTasks[$taskId] = $claimedSubTask
-                    Write-Log "Worker $WorkerId claimed task: $taskId (subtask: $claimedSubTask)" "OK"
-                } else {
-                    $script:claimedSubTasks.Remove($taskId) | Out-Null
-                    Write-Log "Worker $WorkerId claimed task: $taskId" "OK"
+                $isBlocked = $false
+                if ($taskObj -and $taskObj.PSObject.Properties["relations"] -and $taskObj.relations) {
+                    foreach ($rel in $taskObj.relations) {
+                        $relType = if ($rel.PSObject.Properties["type"]) { $rel.type } else { "" }
+                        if ($relType -imatch '^blocked') {
+                            $blockerTaskId = $rel.taskId
+                            if ($blockerTaskId -imatch '^by\s+(.+)$') { $blockerTaskId = $Matches[1] }
+                            if (-not $doneTasks.ContainsKey($blockerTaskId)) {
+                                $isBlocked = $true
+                                break
+                            }
+                        }
+                    }
                 }
 
-                return @{
-                    TaskId = $taskId
-                    ClaimedSubTask = $claimedSubTask
+                $hasPriority = $false
+                if ($taskObj) {
+                    if ($taskObj.PSObject.Properties["tags"] -and $taskObj.tags) {
+                        foreach ($tag in $taskObj.tags) {
+                            if ($tag -ieq "priority") { $hasPriority = $true; break }
+                        }
+                    }
+                    if ($taskObj.PSObject.Properties["priority"] -and $taskObj.priority -in @("high", "critical")) {
+                        $hasPriority = $true
+                    }
                 }
+
+                $candidates.Add(@{
+                    TaskId      = $taskId
+                    TaskObj     = $taskObj
+                    ColumnRank  = $columnRank
+                    IsBlocked   = $isBlocked
+                    HasPriority = $hasPriority
+                }) | Out-Null
             }
         }
+        $columnRank++
     }
 
-    return $null
+    if ($candidates.Count -eq 0) { return $null }
+
+    $sorted = $candidates | Sort-Object -Property @(
+        @{ Expression = { [int]$_.IsBlocked }; Descending = $false },
+        @{ Expression = { [int]$_.HasPriority }; Descending = $true },
+        @{ Expression = { $_.ColumnRank }; Descending = $false }
+    )
+
+    $chosen = if ($sorted -is [array]) { $sorted[0] } else { $sorted }
+    $taskId = $chosen.TaskId
+    $taskObj = $chosen.TaskObj
+    $claimedSubTask = Get-FirstIncompleteSubTask -Task $taskObj
+
+    if ($chosen.IsBlocked) {
+        Write-Log "Worker $WorkerId picking blocked task $taskId (no unblocked tasks available)" "WARN"
+    }
+
+    Push-Location $MAIN_REPO
+    try {
+        kanbn move $taskId -c "In Progress" 2>$null | Out-Null
+    }
+    finally {
+        Pop-Location
+    }
+
+    $script:claimedTasks[$taskId] = $WorkerId
+    if ($claimedSubTask) {
+        $script:claimedSubTasks[$taskId] = $claimedSubTask
+        Write-Log "Worker $WorkerId claimed task: $taskId (subtask: $claimedSubTask)" "OK"
+    } else {
+        $script:claimedSubTasks.Remove($taskId) | Out-Null
+        Write-Log "Worker $WorkerId claimed task: $taskId" "OK"
+    }
+
+    return @{
+        TaskId = $taskId
+        ClaimedSubTask = $claimedSubTask
+    }
 }
 
 function Test-BoardComplete {
