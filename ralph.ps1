@@ -182,6 +182,11 @@ function Patch-ClaudeMD {
 function Configure-WorktreeBuild {
     param([string]$WorktreePath)
 
+    if (-not (Test-Path "$WorktreePath/CMakeLists.txt")) {
+        Write-Log "  No CMakeLists.txt found, skipping cmake configure"
+        return $true
+    }
+
     $buildDir = "$WorktreePath/cmake-build-debug"
 
     # Read cmake cache variables from the main repo's build dir and remap paths
@@ -1793,7 +1798,7 @@ if ($Workers -lt 1) {
     return
 }
 
-foreach ($cmd in @("claude", "kanbn", "cmake", "git", "ninja", "gh")) {
+foreach ($cmd in @("claude", "kanbn", "git", "gh")) {
     if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
         Write-Host "Required command not found: $cmd" -ForegroundColor Red
         return
