@@ -650,6 +650,7 @@ function Get-BlockerTaskIds {
             $relType = if ($rel.PSObject.Properties["type"]) { $rel.type } else { "" }
             if ($relType -imatch '^blocked|^requires') {
                 $bid = $rel.taskId
+                if (-not $bid) { continue }
                 if ($bid -imatch '^by\s+(.+)$') { $bid = $Matches[1] }
                 if (-not $DoneTasks.ContainsKey($bid) -and -not $PRTasks.ContainsKey($bid)) { $ids += $bid }
             }
@@ -721,6 +722,7 @@ function Claim-NextTask {
                         $relType = if ($rel.PSObject.Properties["type"]) { $rel.type } else { "" }
                         if ($relType -ieq 'blocks') {
                             $tid = $rel.taskId
+                            if (-not $tid) { continue }
                             if (-not $reverseBlockedBy.ContainsKey($tid)) { $reverseBlockedBy[$tid] = @() }
                             $reverseBlockedBy[$tid] += $taskId
                         }
