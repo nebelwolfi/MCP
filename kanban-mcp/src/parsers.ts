@@ -55,7 +55,10 @@ export function toMarkdown(fm: Frontmatter, body: string): string {
         yaml += `${key}: []\n`;
       } else {
         yaml += `${key}:\n`;
-        for (const item of value) yaml += `  - ${item}\n`;
+        for (const item of value) {
+          const q = typeof item === "string" && /\s/.test(String(item));
+          yaml += q ? `  - '${item}'\n` : `  - ${item}\n`;
+        }
       }
     } else {
       yaml += `${key}: ${value}\n`;

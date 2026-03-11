@@ -1,0 +1,26 @@
+{
+  "name": "capstone-mcp",
+  "version": "1.0.0",
+  "description": "Capstone disassembler MCP",
+  "type": "module",
+  "main": "dist/index.js",
+  "installConfig": {
+    "displayName": "Capstone Disassembler MCP"
+  },
+  "bin": {
+    "capstone-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "capstone-wasm": "^1.0.3",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}
