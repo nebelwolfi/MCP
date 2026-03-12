@@ -132,7 +132,7 @@ export function spawnWorker(
     cwd: worktreePath,
     stdio: ["pipe", "pipe", "pipe"],
     shell: true,
-    env: { ...process.env, KANBAN_ROOT: worktreePath },
+    env: { ...process.env },
   });
 
   // Write prompt to stdin
