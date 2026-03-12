@@ -1,17 +1,37 @@
 import { readFile, writeFile, readdir, mkdir, rm, access } from "node:fs/promises";
 import { openSync, closeSync, unlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { basename, join } from "node:path";
+import { homedir } from "node:os";
 import type { Task, BoardIndex } from "./types.js";
-import { TASKS_DIR, CONFIG_FILE, TASKS_INDEX_FILE, VERSION_FILE, BOARD_VERSION, DEFAULT_COLUMNS } from "./constants.js";
+import { TASKS_DIR, CONFIG_FILE, TASKS_INDEX_FILE, VERSION_FILE, BOARD_VERSION, DEFAULT_COLUMNS, BOARDS_ROOT } from "./constants.js";
 import { cwd, boardPath, now } from "./helpers.js";
 import { parseFrontmatter, toMarkdown, parseSubtasks, parseRelations, serializeSubtasks, serializeRelations } from "./parsers.js";
 
 const LOCK_FILE = ".lock";
 const OLD_KANBN_DIR = ".kanbn";
 
+// ── Git init for boards root ────────────────────────────────────────────
+
+let boardsRootChecked = false;
+
+async function ensureBoardsRootGit(): Promise<void> {
+  if (boardsRootChecked) return;
+  const root = join(homedir(), BOARDS_ROOT);
+  await mkdir(root, { recursive: true });
+  const gitDir = join(root, ".git");
+  try {
+    await access(gitDir);
+  } catch {
+    execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  }
+  boardsRootChecked = true;
+}
+
 // ── Locking ────────────────────────────────────────────────────────────
 
 export async function withLock<T>(fn: () => Promise<T>): Promise<T> {
+  await ensureBoardsRootGit();
   const lockPath = boardPath(LOCK_FILE);
   await mkdir(boardPath(), { recursive: true });
   const deadline = Date.now() + 10_000;
@@ -284,6 +304,7 @@ export async function listOrphanedFiles(): Promise<string[]> {
 // ── Board initialization + auto-migration ──────────────────────────────
 
 export async function ensureBoard(): Promise<void> {
+  await ensureBoardsRootGit();
   if (await boardExists()) return;
 
   // Check for old-format board to migrate

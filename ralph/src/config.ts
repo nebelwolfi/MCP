@@ -10,11 +10,13 @@ function hasFlag(args: string[], name: string): boolean {
   return args.includes(`--${name}`);
 }
 
-export function parseArgs(argv: string[]): Config {
-  const args = argv.slice(2);
+const KNOWN_FLAGS = new Set([
+  "help", "h", "workers", "iterations-per-worker", "skip-build",
+  "cleanup", "merge-only", "base-branch", "project-dir",
+]);
 
-  if (hasFlag(args, "help") || hasFlag(args, "h")) {
-    console.log(`ralph — parallel Claude worker orchestrator
+function printHelp(): never {
+  console.log(`ralph — parallel Claude worker orchestrator
 
 Usage: ralph [options]
 
@@ -26,7 +28,23 @@ Options:
   --merge-only               Only drain pending PRs, no task work
   --base-branch NAME         Base branch (default: auto-detect)
   --project-dir PATH         Project directory (default: cwd)`);
-    process.exit(0);
+  process.exit(0);
+}
+
+export function parseArgs(argv: string[]): Config {
+  const args = argv.slice(2);
+
+  if (hasFlag(args, "help") || hasFlag(args, "h")) printHelp();
+
+  // Check for unknown flags
+  for (const arg of args) {
+    if (arg.startsWith("--")) {
+      const name = arg.slice(2);
+      if (!KNOWN_FLAGS.has(name)) {
+        console.error(`Unknown option: ${arg}\n`);
+        printHelp();
+      }
+    }
   }
 
   return {
