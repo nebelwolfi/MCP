@@ -545,11 +545,11 @@ function Write-KanbanIndex {
     $fmStr = ""
     if ($Index.startedColumns -and $Index.startedColumns.Count -gt 0) {
         $fmStr += "startedColumns:`n"
-        foreach ($sc in $Index.startedColumns) { $fmStr += "  - $sc`n" }
+        foreach ($sc in $Index.startedColumns) { $fmStr += "  - '$sc'`n" }
     }
     if ($Index.completedColumns -and $Index.completedColumns.Count -gt 0) {
         $fmStr += "completedColumns:`n"
-        foreach ($cc in $Index.completedColumns) { $fmStr += "  - $cc`n" }
+        foreach ($cc in $Index.completedColumns) { $fmStr += "  - '$cc'`n" }
     }
     $newContent = "---`n${fmStr}---`n`n# $($Index.name)`n"
     foreach ($col in $Index.columns) {
