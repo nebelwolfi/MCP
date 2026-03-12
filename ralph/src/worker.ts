@@ -1,9 +1,40 @@
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { appendFileSync, writeFileSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
 import type { WorkerResult, WorkerStatus } from "./types.js";
 import { log } from "./logger.js";
 import { gitInDir, isKanbnPath } from "./git.js";
+
+// Resolve claude executable path once at module load.
+// shell: false needs the full path on Windows since cmd.exe isn't resolving it.
+let resolvedClaudePath = "claude";
+try {
+  const result = execFileSync("where", ["claude"], { encoding: "utf-8" }).trim();
+  resolvedClaudePath = result.split(/\r?\n/)[0];
+} catch { /* fallback to bare "claude" */ }
+
+function spawnClaude(
+  args: string[],
+  prompt: string,
+  cwd: string,
+  env?: NodeJS.ProcessEnv,
+): ChildProcess {
+  // shell: false avoids cmd.exe intermediary that breaks stdin piping with detached processes.
+  // detached: true prevents Ctrl+C SIGINT from propagating to workers.
+  const child = spawn(resolvedClaudePath, args, {
+    cwd,
+    stdio: ["pipe", "pipe", "pipe"],
+    shell: false,
+    detached: true,
+    windowsHide: true,
+    env,
+  });
+
+  child.stdin!.write(prompt);
+  child.stdin!.end();
+
+  return child;
+}
 
 function getWorkerPrompt(taskId: string, claimedSubTask: string | null): string {
   let subTaskInstructions = "";
@@ -123,23 +154,13 @@ export function spawnWorker(
 
   appendFileSync(logFile, `[${timestamp()}] Worker ${workerId} - Running task ${taskId}\n`);
 
-  const child = spawn("claude", [
+  const claudeArgs = [
     "--model", "claude-opus-4-6",
     "--effort", "high",
     "--permission-mode", "bypassPermissions",
     "-p",
-  ], {
-    cwd: worktreePath,
-    stdio: ["pipe", "pipe", "pipe"],
-    shell: true,
-    detached: true,
-    windowsHide: true,
-    env: { ...process.env },
-  });
-
-  // Write prompt to stdin
-  child.stdin!.write(prompt);
-  child.stdin!.end();
+  ];
+  const child = spawnClaude(claudeArgs, prompt, worktreePath, { ...process.env });
 
   const promise = new Promise<WorkerResult>((resolve) => {
     const chunks: Buffer[] = [];
@@ -202,21 +223,12 @@ export function spawnMergeReviewWorker(
 
   appendFileSync(logFile, `[${timestamp()}] Worker ${workerId} - Reviewing PR #${prNumber}\n`);
 
-  const child = spawn("claude", [
+  const child = spawnClaude([
     "--model", "claude-opus-4-6",
     "--effort", "high",
     "--permission-mode", "bypassPermissions",
     "-p",
-  ], {
-    cwd: worktreePath,
-    stdio: ["pipe", "pipe", "pipe"],
-    shell: true,
-    detached: true,
-    windowsHide: true,
-  });
-
-  child.stdin!.write(prompt);
-  child.stdin!.end();
+  ], prompt, worktreePath);
 
   const promise = new Promise<WorkerResult>((resolve) => {
     const chunks: Buffer[] = [];
