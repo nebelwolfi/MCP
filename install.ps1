@@ -169,25 +169,25 @@ foreach ($comp in $toInstall) {
             }
         }
 
-        # Remove legacy profile functions that are now handled by npm link
+        # Remove legacy profile entries that are now handled by npm link
         $profileContent = Get-Content $PROFILE -Raw
         if ($profileContent) {
-            $legacyPatterns = @()
+            $cleaned = $profileContent
+
+            # Remove legacy profile functions matching bin names (e.g. "function Kanban-Open {")
             if ($comp.PackageJson.bin) {
                 foreach ($binName in $comp.PackageJson.bin.PSObject.Properties.Name) {
-                    $legacyPatterns += [regex]::Escape($binName)
+                    $escaped = [regex]::Escape($binName)
+                    $cleaned = ($cleaned -split "`n" | Where-Object { $_ -notmatch "function\s+$escaped\s*\{" }) -join "`n"
                 }
             }
-            # Also clean up ralph.ps1 dot-source
-            $legacyPatterns += 'ralph\.ps1'
 
-            $cleaned = $profileContent
-            foreach ($pattern in $legacyPatterns) {
-                $cleaned = ($cleaned -split "`n" | Where-Object { $_ -notmatch "function\s+$pattern\s*\{" }) -join "`n"
-            }
+            # Remove ralph.ps1 dot-source line (e.g. '. "C:\...\ralph.ps1"')
+            $cleaned = ($cleaned -split "`n" | Where-Object { $_ -notmatch 'ralph\.ps1' }) -join "`n"
+
             if ($cleaned -ne $profileContent) {
                 Set-Content $PROFILE -Value $cleaned -NoNewline -Encoding UTF8
-                Write-Host "  Cleaned up legacy profile functions."
+                Write-Host "  Cleaned up legacy profile entries."
             }
         }
     }
