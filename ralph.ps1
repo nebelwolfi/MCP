@@ -423,58 +423,223 @@ function Get-ColumnIndex {
     return -1
 }
 
+function Parse-KanbanFrontmatter {
+    param([string]$Content)
+    $fm = @{}
+    $body = $Content
+    if ($Content -match '(?s)^---\r?\n(.*?)\r?\n---\r?\n?(.*)$') {
+        $fmBlock = $Matches[1]
+        $body = $Matches[2].TrimStart()
+        $fmLines = $fmBlock -split "`n"
+        $i = 0
+        while ($i -lt $fmLines.Count) {
+            $ln = $fmLines[$i].TrimEnd()
+            if (-not $ln) { $i++; continue }
+            $ci = $ln.IndexOf(':')
+            if ($ci -lt 0) { $i++; continue }
+            $key = $ln.Substring(0, $ci).Trim()
+            $val = $ln.Substring($ci + 1).Trim()
+            if ($val -eq '' -and ($i + 1) -lt $fmLines.Count -and $fmLines[$i + 1] -match '^\s+-') {
+                $arr = @()
+                $i++
+                while ($i -lt $fmLines.Count -and $fmLines[$i] -match '^\s+-') {
+                    $arr += ($fmLines[$i] -replace '^\s+-\s*', '').Trim().Trim("'""")
+                    $i++
+                }
+                $fm[$key] = $arr
+                continue
+            }
+            if ($val -match '^\[(.*)\]$') {
+                $inner = $Matches[1]
+                $fm[$key] = if ($inner) { @($inner -split ',' | ForEach-Object { $_.Trim().Trim("'""") } | Where-Object { $_ }) } else { @() }
+            } else {
+                $fm[$key] = $val.Trim("'""")
+            }
+            $i++
+        }
+    }
+    return @{ frontmatter = $fm; body = $body }
+}
+
+function Read-KanbanTaskDirect {
+    param([string]$RepoPath = $MAIN_REPO, [string]$TaskId, [string]$Column = "")
+    $taskPath = "$RepoPath/.kanbn/tasks/$TaskId.md"
+    if (-not (Test-Path $taskPath)) { return $null }
+    try { $raw = [System.IO.File]::ReadAllText($taskPath, [System.Text.Encoding]::UTF8) } catch { return $null }
+    $parsed = Parse-KanbanFrontmatter -Content $raw
+    $fm = $parsed.frontmatter
+    $body = $parsed.body
+    $title = $TaskId
+    if ($body -match '(?m)^# (.+)$') { $title = $Matches[1].Trim() }
+    $stripped = ($body -replace '(?s)\n---\r?\n.*?\r?\n---', '')
+    $stripped = ($stripped -replace '(?m)^# .+\n*', '').Trim()
+    $relations = @()
+    if ($stripped -match '(?s)(## Relations\r?\n)(.*?)(?=\n## |\s*$)') {
+        foreach ($line in ($Matches[2] -split "`n")) {
+            $relText = $null
+            if ($line -match '^- \[([^\]]+)\]\([^)]+\)$') { $relText = $Matches[1].Trim() }
+            elseif ($line -match '^- \[([^\]]+)\]$') { $relText = $Matches[1].Trim() }
+            if ($relText) {
+                $parts = $relText -split '\s+', 2
+                if ($parts.Count -gt 1) {
+                    $relations += [PSCustomObject]@{ type = $parts[0]; taskId = $parts[1] }
+                } else {
+                    $relations += [PSCustomObject]@{ type = ""; taskId = $parts[0] }
+                }
+            }
+        }
+    }
+    $subTasks = @()
+    if ($stripped -match '(?s)(## Sub-tasks\r?\n)(.*?)(?=\n## |\s*$)') {
+        foreach ($line in ($Matches[2] -split "`n")) {
+            if ($line -match '^- \[([ xX])\] (.+)$') {
+                $subTasks += [PSCustomObject]@{ text = $Matches[2].Trim(); completed = ($Matches[1] -ne ' ') }
+            }
+        }
+    }
+    $tags = @()
+    if ($fm.ContainsKey('tags')) {
+        if ($fm['tags'] -is [array]) { $tags = $fm['tags'] } elseif ($fm['tags']) { $tags = @($fm['tags']) }
+    }
+    $priority = if ($fm.ContainsKey('priority') -and $fm['priority']) { $fm['priority'] } else { "medium" }
+    return [PSCustomObject]@{
+        id = $TaskId; title = $title; subTasks = $subTasks; relations = $relations
+        column = $Column; tags = $tags; priority = $priority
+    }
+}
+
+function Read-KanbanIndex {
+    param([string]$RepoPath = $MAIN_REPO)
+    $indexPath = "$RepoPath/.kanbn/index.md"
+    if (-not (Test-Path $indexPath)) { return $null }
+    try { $raw = [System.IO.File]::ReadAllText($indexPath, [System.Text.Encoding]::UTF8) } catch { return $null }
+    $parsed = Parse-KanbanFrontmatter -Content $raw
+    $fm = $parsed.frontmatter
+    $body = $parsed.body
+    $boardName = ""
+    if ($body -match '(?m)^# (.+)$') { $boardName = $Matches[1].Trim() }
+    $startedCols = if ($fm.ContainsKey('startedColumns') -and $fm['startedColumns'] -is [array]) { $fm['startedColumns'] } else { @("In Progress") }
+    $completedCols = if ($fm.ContainsKey('completedColumns') -and $fm['completedColumns'] -is [array]) { $fm['completedColumns'] } else { @("Done") }
+    $columns = @()
+    $tasksByColumn = @{}
+    $h2Matches = [regex]::Matches($body, '(?m)^## (.+)$')
+    for ($i = 0; $i -lt $h2Matches.Count; $i++) {
+        $colName = $h2Matches[$i].Groups[1].Value.Trim()
+        $columns += $colName
+        $tasksByColumn[$colName] = @()
+        $sectionStart = $h2Matches[$i].Index + $h2Matches[$i].Length
+        $sectionEnd = if (($i + 1) -lt $h2Matches.Count) { $h2Matches[$i + 1].Index } else { $body.Length }
+        $section = $body.Substring($sectionStart, $sectionEnd - $sectionStart)
+        $linkMatches = [regex]::Matches($section, '(?m)^- \[([^\]]+)\]\(tasks/[^)]+\.md\)')
+        foreach ($lm in $linkMatches) { $tasksByColumn[$colName] += $lm.Groups[1].Value.Trim() }
+    }
+    return @{
+        name = $boardName; columns = $columns; tasksByColumn = $tasksByColumn
+        startedColumns = $startedCols; completedColumns = $completedCols
+    }
+}
+
+function Write-KanbanIndex {
+    param([string]$RepoPath = $MAIN_REPO, $Index)
+    $indexPath = "$RepoPath/.kanbn/index.md"
+    $fmStr = ""
+    if ($Index.startedColumns -and $Index.startedColumns.Count -gt 0) {
+        $fmStr += "startedColumns:`n"
+        foreach ($sc in $Index.startedColumns) { $fmStr += "  - $sc`n" }
+    }
+    if ($Index.completedColumns -and $Index.completedColumns.Count -gt 0) {
+        $fmStr += "completedColumns:`n"
+        foreach ($cc in $Index.completedColumns) { $fmStr += "  - $cc`n" }
+    }
+    $newContent = "---`n${fmStr}---`n`n# $($Index.name)`n"
+    foreach ($col in $Index.columns) {
+        $tasks = $Index.tasksByColumn[$col]
+        $newContent += "`n## $col`n"
+        if ($tasks -and $tasks.Count -gt 0) {
+            $newContent += "`n"
+            foreach ($tid in $tasks) { $newContent += "- [$tid](tasks/$tid.md)`n" }
+        }
+    }
+    [System.IO.File]::WriteAllText($indexPath, $newContent, [System.Text.Encoding]::UTF8)
+}
+
+function Move-KanbanTask {
+    param([string]$RepoPath = $MAIN_REPO, [string]$TaskId, [string]$Column)
+    $index = Read-KanbanIndex -RepoPath $RepoPath
+    if (-not $index) { return $false }
+    if ($Column -notin $index.columns) { return $false }
+    foreach ($col in $index.columns) {
+        $index.tasksByColumn[$col] = @($index.tasksByColumn[$col] | Where-Object { $_ -ne $TaskId })
+    }
+    $index.tasksByColumn[$Column] += $TaskId
+    Write-KanbanIndex -RepoPath $RepoPath -Index $index
+    $taskPath = "$RepoPath/.kanbn/tasks/$TaskId.md"
+    if (Test-Path $taskPath) {
+        try {
+            $taskRaw = [System.IO.File]::ReadAllText($taskPath, [System.Text.Encoding]::UTF8)
+            if ($taskRaw -match '(?s)^---\r?\n(.*?)\r?\n---') {
+                $fmBlock = $Matches[1]
+                $newFm = $fmBlock
+                $now = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+                if ($newFm -match '(?m)^updated:.*$') {
+                    $newFm = $newFm -replace '(?m)^updated:.*$', "updated: $now"
+                } else {
+                    $newFm += "`nupdated: $now"
+                }
+                if ($Column -in $index.startedColumns -and $newFm -notmatch '(?m)^started:') {
+                    $newFm += "`nstarted: $now"
+                }
+                if ($Column -in $index.completedColumns -and $newFm -notmatch '(?m)^completed:') {
+                    $newFm += "`ncompleted: $now"
+                }
+                if ($newFm -ne $fmBlock) {
+                    $taskRaw = $taskRaw.Remove($Matches.Index, $Matches.Length).Insert($Matches.Index, "---`n$newFm`n---")
+                    [System.IO.File]::WriteAllText($taskPath, $taskRaw, [System.Text.Encoding]::UTF8)
+                }
+            }
+        } catch {}
+    }
+    return $true
+}
+
 function Get-BoardJson {
     param([string]$RepoPath = $MAIN_REPO)
-
-    Push-Location $RepoPath
-    try {
-        $boardRaw = kanbn board -j 2>$null
-        if (-not $boardRaw) { return $null }
-        return $boardRaw | ConvertFrom-Json
+    $index = Read-KanbanIndex -RepoPath $RepoPath
+    if (-not $index) { return $null }
+    $headings = @()
+    $colArrays = @()
+    foreach ($colName in $index.columns) {
+        $headings += [PSCustomObject]@{ name = $colName }
+        $taskObjs = @()
+        foreach ($tid in $index.tasksByColumn[$colName]) {
+            $taskObj = Read-KanbanTaskDirect -RepoPath $RepoPath -TaskId $tid -Column $colName
+            if ($taskObj) { $taskObjs += $taskObj }
+            else { $taskObjs += [PSCustomObject]@{ id = $tid; column = $colName; subTasks = @(); relations = @(); tags = @(); priority = "medium" } }
+        }
+        $colArrays += ,@($taskObjs)
     }
-    catch {
-        Write-Log "Failed to parse kanbn board JSON in $RepoPath" "ERROR"
-        return $null
-    }
-    finally {
-        Pop-Location
+    return [PSCustomObject]@{
+        headings = $headings
+        lanes = @([PSCustomObject]@{ columns = $colArrays })
+        startedColumns = $index.startedColumns
+        completedColumns = $index.completedColumns
     }
 }
 
 function Get-TaskJson {
     param([string]$RepoPath, [string]$TaskId)
-
     if (-not $TaskId) { return $null }
-
-    Push-Location $RepoPath
-    try {
-        $taskRaw = kanbn task $TaskId -j 2>$null
-        if ($taskRaw) {
-            try {
-                return $taskRaw | ConvertFrom-Json -ErrorAction Stop
-            }
-            catch {
-                # Some kanbn versions emit non-strict JSON for `task -j`; fallback to board scan.
-            }
-        }
-    }
-    finally {
-        Pop-Location
-    }
-
+    $taskObj = Read-KanbanTaskDirect -RepoPath $RepoPath -TaskId $TaskId
+    if ($taskObj) { return $taskObj }
     $board = Get-BoardJson -RepoPath $RepoPath
     if (-not $board) { return $null }
-
     foreach ($lane in $board.lanes) {
         for ($c = 0; $c -lt $lane.columns.Count; $c++) {
             foreach ($task in (Get-ColumnTaskItems -ColumnTasks $lane.columns[$c])) {
-                if ((Get-TaskId -Task $task) -eq $TaskId) {
-                    return $task
-                }
+                if ((Get-TaskId -Task $task) -eq $TaskId) { return $task }
             }
         }
     }
-
     return $null
 }
 
@@ -608,13 +773,7 @@ function Repair-DoneCardsWithIncompleteSubTasks {
 
             $taskObj = if ($task.PSObject.Properties["subTasks"]) { $task } else { Get-TaskJson -RepoPath $MAIN_REPO -TaskId $taskId }
             if (-not (Test-AllSubTasksComplete -Task $taskObj)) {
-                Push-Location $MAIN_REPO
-                try {
-                    kanbn move $taskId -c "In Progress" 2>$null | Out-Null
-                }
-                finally {
-                    Pop-Location
-                }
+                Move-KanbanTask -RepoPath $MAIN_REPO -TaskId $taskId -Column "In Progress" | Out-Null
                 Write-Log "Moved $taskId from Done to In Progress (incomplete subtasks)" "WARN"
                 $repaired++
             }
@@ -821,13 +980,7 @@ function Claim-NextTask {
     $taskObj = $chosen.TaskObj
     $claimedSubTask = Get-FirstIncompleteSubTask -Task $taskObj
 
-    Push-Location $MAIN_REPO
-    try {
-        kanbn move $taskId -c "In Progress" 2>$null | Out-Null
-    }
-    finally {
-        Pop-Location
-    }
+    Move-KanbanTask -RepoPath $MAIN_REPO -TaskId $taskId -Column "In Progress" | Out-Null
 
     $script:claimedTasks[$taskId] = $WorkerId
     if ($claimedSubTask) {
@@ -1800,7 +1953,7 @@ if ($Workers -lt 1) {
     return
 }
 
-foreach ($cmd in @("claude", "kanbn", "git", "gh")) {
+foreach ($cmd in @("claude", "git", "gh")) {
     if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
         Write-Host "Required command not found: $cmd" -ForegroundColor Red
         return
@@ -2013,15 +2166,9 @@ try {
                     $allSubTasksComplete = Test-AllSubTasksComplete -Task $mainTask
 
                     if ($allSubTasksComplete) {
-                        Push-Location $MAIN_REPO
-                        try {
-                            kanbn move $jobInfo.TaskId -c "Done" 2>$null | Out-Null
-                            $script:completedTasks[$jobInfo.TaskId] = $true
-                            New-TaskPR -TaskId $jobInfo.TaskId
-                        }
-                        finally {
-                            Pop-Location
-                        }
+                        Move-KanbanTask -RepoPath $MAIN_REPO -TaskId $jobInfo.TaskId -Column "Done" | Out-Null
+                        $script:completedTasks[$jobInfo.TaskId] = $true
+                        New-TaskPR -TaskId $jobInfo.TaskId
                         Release-TaskClaim -TaskId $jobInfo.TaskId
 
                         if (Test-BoardComplete) {
@@ -2041,28 +2188,15 @@ try {
                             $activeJobs[$workerId] = @{ Job = $newJob; TaskId = $jobInfo.TaskId; ClaimedSubTask = $nextSub }
                             continue
                         } else {
-                            # Edge case: no subtasks left but Test-AllSubTasksComplete disagreed
-                            Push-Location $MAIN_REPO
-                            try {
-                                kanbn move $jobInfo.TaskId -c "Done" 2>$null | Out-Null
-                                $script:completedTasks[$jobInfo.TaskId] = $true
-                                New-TaskPR -TaskId $jobInfo.TaskId
-                            }
-                            finally {
-                                Pop-Location
-                            }
+                            Move-KanbanTask -RepoPath $MAIN_REPO -TaskId $jobInfo.TaskId -Column "Done" | Out-Null
+                            $script:completedTasks[$jobInfo.TaskId] = $true
+                            New-TaskPR -TaskId $jobInfo.TaskId
                             Release-TaskClaim -TaskId $jobInfo.TaskId
                         }
                     }
                 }
                 elseif ($status -eq "ERROR") {
-                    Push-Location $MAIN_REPO
-                    try {
-                        kanbn move $jobInfo.TaskId -c "Todo" 2>$null | Out-Null
-                    }
-                    finally {
-                        Pop-Location
-                    }
+                    Move-KanbanTask -RepoPath $MAIN_REPO -TaskId $jobInfo.TaskId -Column "Todo" | Out-Null
                     Release-TaskClaim -TaskId $jobInfo.TaskId
                     Write-Log "Task $($jobInfo.TaskId) errored" "WARN"
                 } elseif ($status -ne "NO_COMMITS") {
@@ -2117,13 +2251,9 @@ try {
                                 } else {
                                     # All subtasks done - move to Done, create PR, release claim
                                     Write-Log "All subtasks complete for $($jobInfo.TaskId), moving to Done" "OK"
-                                    Push-Location $MAIN_REPO
-                                    try {
-                                        kanbn move $jobInfo.TaskId -c "Done" 2>$null | Out-Null
-                                        $script:completedTasks[$jobInfo.TaskId] = $true
-                                        New-TaskPR -TaskId $jobInfo.TaskId
-                                    }
-                                    finally { Pop-Location }
+                                    Move-KanbanTask -RepoPath $MAIN_REPO -TaskId $jobInfo.TaskId -Column "Done" | Out-Null
+                                    $script:completedTasks[$jobInfo.TaskId] = $true
+                                    New-TaskPR -TaskId $jobInfo.TaskId
                                     Release-TaskClaim -TaskId $jobInfo.TaskId
                                     $advanced = $true
 
@@ -2139,9 +2269,7 @@ try {
                             # Bail out after 5 consecutive NO_COMMITS on same subtask
                             if ($noCommitCounts[$ncKey] -ge 5) {
                                 Write-Log "Worker ${workerId}: $($noCommitCounts[$ncKey]) NO_COMMITS on $ncKey, giving up" "WARN"
-                                Push-Location $MAIN_REPO
-                                try { kanbn move $jobInfo.TaskId -c "Todo" 2>$null | Out-Null }
-                                finally { Pop-Location }
+                                Move-KanbanTask -RepoPath $MAIN_REPO -TaskId $jobInfo.TaskId -Column "Todo" | Out-Null
                                 Release-TaskClaim -TaskId $jobInfo.TaskId
                                 $noCommitCounts.Remove($ncKey)
                                 # fall through to Priority 1/2
@@ -2245,13 +2373,7 @@ try {
 
                 # Only move real kanbn tasks back to Todo (not merge-review pseudo-tasks)
                 if ($jobInfo.TaskId -and $jobInfo.TaskId -ne "merge-review") {
-                    Push-Location $MAIN_REPO
-                    try {
-                        kanbn move $jobInfo.TaskId -c "Todo" 2>$null | Out-Null
-                    }
-                    finally {
-                        Pop-Location
-                    }
+                    Move-KanbanTask -RepoPath $MAIN_REPO -TaskId $jobInfo.TaskId -Column "Todo" | Out-Null
                     Release-TaskClaim -TaskId $jobInfo.TaskId
                 }
 
@@ -2352,15 +2474,9 @@ finally {
 
     # Move uncompleted claimed tasks back to In Progress
     if ($script:claimedTasks.Count -gt 0) {
-        Push-Location $MAIN_REPO
-        try {
-            foreach ($taskId in @($script:claimedTasks.Keys)) {
-                kanbn move $taskId -c "In Progress" 2>$null | Out-Null
-                Release-TaskClaim -TaskId $taskId
-            }
-        }
-        finally {
-            Pop-Location
+        foreach ($taskId in @($script:claimedTasks.Keys)) {
+            Move-KanbanTask -RepoPath $MAIN_REPO -TaskId $taskId -Column "In Progress" | Out-Null
+            Release-TaskClaim -TaskId $taskId
         }
     }
     $script:claimedSubTasks.Clear()

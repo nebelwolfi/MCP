@@ -6,9 +6,7 @@
   "main": "dist/index.js",
   "installConfig": {
     "displayName": "Kanban Board MCP",
-    "prerequisites": [
-      { "command": "kanbn", "install": "npm install -g @basementuniverse/kanbn --silent", "label": "kanbn CLI" }
-    ],
+    "prerequisites": [],
     "profileSetup": [
       { "name": "Kanban-Open", "body": "function Kanban-Open { node \"{{entryDir}}/dist/web.js\" @args }" }
     ]
