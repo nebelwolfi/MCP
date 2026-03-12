@@ -115,6 +115,7 @@ if (-not (Test-Path $PROFILE)) {
 }
 
 # --- Install each component ---
+$profileChanged = $false
 foreach ($comp in $toInstall) {
     $name = $comp.Name
     Write-Host ""
@@ -196,6 +197,7 @@ foreach ($comp in $toInstall) {
             if ($cleaned -ne $profileContent) {
                 Set-Content $PROFILE -Value $cleaned -NoNewline -Encoding UTF8
                 Write-Host "  Cleaned up legacy profile entries."
+                $profileChanged = $true
             }
         }
     }
@@ -205,6 +207,7 @@ foreach ($comp in $toInstall) {
         if (-not $profileContent -or -not $profileContent.Contains($comp.Script)) {
             Add-Content $PROFILE "`n$dotSource"
             Write-Host "  Registered in profile ($PROFILE)."
+            $profileChanged = $true
         } else {
             Write-Host "  Already registered in profile."
         }
@@ -217,4 +220,6 @@ foreach ($comp in $toInstall) {
 $saved | ConvertTo-Json | Set-Content $installedPath -Encoding UTF8
 Write-Host ""
 Write-Host "Install state saved to $installedPath"
-Write-Host 'Reload your shell: . "$PROFILE"'
+if ($profileChanged) {
+    Write-Host 'Reload your shell: . "$PROFILE"'
+}
