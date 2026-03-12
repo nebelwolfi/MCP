@@ -6,7 +6,7 @@ import { spawnMergeReviewWorker } from "./worker.js";
 import { getBoardJson, getColumnIndex } from "./kanban.js";
 import type { OrchestratorState, PullRequest, WorkerResult } from "./types.js";
 
-/** Push worker results to remote. Returns true on success. */
+/** Push worker results to remote (or validate locally in --local mode). Returns true on success. */
 export function publishWorkerResults(
   state: OrchestratorState,
   worktreePath: string,
@@ -14,32 +14,37 @@ export function publishWorkerResults(
   taskId: string,
 ): boolean {
   const taskBranch = `ralph/${taskId}`;
+  const local = state.local;
   let success = true;
 
-  // 1. Push submodule changes
+  // 1. Push submodule changes (skip pushes in local mode)
   for (const sub of state.submodules) {
     const subPath = join(worktreePath, sub);
     if (!existsSync(join(subPath, ".git"))) continue;
 
-    const { stdout: hasCommits } = gitInDir(subPath, "log", "--oneline", `origin/${state.baseBranch}..HEAD`);
+    const baseRef = local ? state.baseBranch : `origin/${state.baseBranch}`;
+    const { stdout: hasCommits } = gitInDir(subPath, "log", "--oneline", `${baseRef}..HEAD`);
     if (!hasCommits) {
+      if (local) continue;
       const { stdout: hasMainCommits } = gitInDir(subPath, "log", "--oneline", "origin/main..HEAD");
       if (!hasMainCommits) continue;
     }
 
-    gitInDir(subPath, "fetch", "origin", state.baseBranch);
-    const { exitCode: rebaseExit, stdout: rebaseOut } = gitInDir(subPath, "rebase", `origin/${state.baseBranch}`);
-    if (rebaseExit !== 0) {
-      log(`  Worker ${workerId} sub ${sub} rebase failed: ${rebaseOut}`, "WARN");
-      gitInDir(subPath, "rebase", "--abort");
-      success = false;
-      continue;
-    }
+    if (!local) {
+      gitInDir(subPath, "fetch", "origin", state.baseBranch);
+      const { exitCode: rebaseExit, stdout: rebaseOut } = gitInDir(subPath, "rebase", `origin/${state.baseBranch}`);
+      if (rebaseExit !== 0) {
+        log(`  Worker ${workerId} sub ${sub} rebase failed: ${rebaseOut}`, "WARN");
+        gitInDir(subPath, "rebase", "--abort");
+        success = false;
+        continue;
+      }
 
-    const { exitCode: pushExit, stdout: pushOut } = gitInDir(subPath, "push", "origin", `HEAD:${state.baseBranch}`);
-    if (pushExit !== 0) {
-      log(`  Worker ${workerId} sub ${sub} push failed: ${pushOut}`, "ERROR");
-      success = false;
+      const { exitCode: pushExit, stdout: pushOut } = gitInDir(subPath, "push", "origin", `HEAD:${state.baseBranch}`);
+      if (pushExit !== 0) {
+        log(`  Worker ${workerId} sub ${sub} push failed: ${pushOut}`, "ERROR");
+        success = false;
+      }
     }
   }
 
@@ -47,13 +52,16 @@ export function publishWorkerResults(
 
   // 2. Validate: no conflict markers
   if (hasConflictMarkers(worktreePath)) {
-    log(`Worker ${workerId} BLOCKED: conflict markers detected in task branch, refusing to push`, "ERROR");
+    log(`Worker ${workerId} BLOCKED: conflict markers detected in task branch`, "ERROR");
     return false;
   }
 
   // 3. Strip .kanbn changes
-  gitInDir(worktreePath, "fetch", "origin", state.baseBranch);
-  const { stdout: changedFiles } = gitInDir(worktreePath, "diff", "--name-only", `origin/${state.baseBranch}..HEAD`);
+  const baseRef = local ? state.baseBranch : `origin/${state.baseBranch}`;
+  if (!local) {
+    gitInDir(worktreePath, "fetch", "origin", state.baseBranch);
+  }
+  const { stdout: changedFiles } = gitInDir(worktreePath, "diff", "--name-only", `${baseRef}..HEAD`);
   let hasKanbnChanges = false;
   if (changedFiles) {
     hasKanbnChanges = changedFiles.split("\n").some((f) => isKanbnPath(f));
@@ -61,12 +69,17 @@ export function publishWorkerResults(
 
   if (hasKanbnChanges) {
     log(`  Worker ${workerId} stripping .kanbn changes from task branch`, "WARN");
-    gitInDir(worktreePath, "checkout", `origin/${state.baseBranch}`, "--", ".kanbn");
+    gitInDir(worktreePath, "checkout", baseRef, "--", ".kanbn");
     gitInDir(worktreePath, "add", ".kanbn");
     const { exitCode: cachedExit } = gitInDir(worktreePath, "diff", "--cached", "--quiet");
     if (cachedExit !== 0) {
       gitInDir(worktreePath, "commit", "-m", "chore: remove .kanbn edits from worker branch");
     }
+  }
+
+  if (local) {
+    log(`Worker ${workerId} validated ${taskBranch} (local mode)`, "OK");
+    return true;
   }
 
   // 4. Push task branch
@@ -80,8 +93,51 @@ export function publishWorkerResults(
   return true;
 }
 
+/** Merge a task branch into the base branch locally (used in --local mode). */
+export function mergeTaskLocally(state: OrchestratorState, taskId: string): void {
+  const taskBranch = `ralph/${taskId}`;
+
+  // Check the branch exists
+  const { exitCode: branchExists } = gitSync(state.mainRepo, "rev-parse", "--verify", taskBranch);
+  if (branchExists !== 0) {
+    log(`  Local merge skip ${taskId}: branch does not exist`, "WARN");
+    return;
+  }
+
+  // Check for actual changes vs base
+  const { stdout: cherry } = gitSync(state.mainRepo, "cherry", state.baseBranch, taskBranch);
+  if (!cherry || !cherry.split("\n").some((l) => l.startsWith("+"))) {
+    log(`  Local merge skip ${taskId}: no changes vs ${state.baseBranch}`, "WARN");
+    return;
+  }
+
+  // Save current branch
+  const { stdout: currentBranch } = gitSync(state.mainRepo, "rev-parse", "--abbrev-ref", "HEAD");
+
+  gitSync(state.mainRepo, "checkout", state.baseBranch);
+  const { exitCode: mergeExit, stdout: mergeOut } = gitSync(state.mainRepo, "merge", "--no-ff", taskBranch, "-m", `ralph: merge ${taskId}`);
+
+  if (mergeExit === 0) {
+    log(`Merged ${taskBranch} into ${state.baseBranch} locally`, "OK");
+    gitSync(state.mainRepo, "branch", "-D", taskBranch);
+  } else {
+    log(`Local merge failed for ${taskBranch}: ${mergeOut}`, "WARN");
+    gitSync(state.mainRepo, "merge", "--abort");
+  }
+
+  // Restore branch if needed
+  if (currentBranch && currentBranch !== state.baseBranch) {
+    gitSync(state.mainRepo, "checkout", currentBranch);
+  }
+}
+
 /** Create a PR for a completed task. */
 export function createTaskPR(state: OrchestratorState, taskId: string): void {
+  if (state.local) {
+    mergeTaskLocally(state, taskId);
+    return;
+  }
+
   const taskBranch = `ralph/${taskId}`;
 
   gitSync(state.mainRepo, "fetch", "origin", taskBranch, state.baseBranch);
@@ -117,6 +173,8 @@ export function createTaskPR(state: OrchestratorState, taskId: string): void {
 
 /** Create PRs for all tasks in the Done column that have remote branches. */
 export async function createPRsForDoneTasks(state: OrchestratorState): Promise<void> {
+  if (state.local) return;
+
   const board = await getBoardJson(state.mainRepo);
   if (!board) {
     log("Cannot read board for Done-task PR sweep", "WARN");
@@ -288,11 +346,14 @@ export function cleanupBranchAfterMerge(
     log(`  Cleaned up local branch: ${taskBranch}`, "OK");
   }
 
-  gitSync(state.mainRepo, "push", "origin", "--delete", taskBranch);
+  if (!state.local) {
+    gitSync(state.mainRepo, "push", "origin", "--delete", taskBranch);
+  }
 }
 
-/** Get all open ralph PRs. */
-export function getPendingRalphPRs(mainRepo: string): PullRequest[] {
+/** Get all open ralph PRs. Returns empty in --local mode. */
+export function getPendingRalphPRs(mainRepo: string, local = false): PullRequest[] {
+  if (local) return [];
   const { stdout, exitCode } = ghInDir(mainRepo, "pr", "list", "--json", "number,headRefName,mergeable,mergeStateStatus");
   if (exitCode !== 0 || !stdout) return [];
 
@@ -310,6 +371,8 @@ export async function drainPendingPRs(
   mergeWorktreePath: string | null,
   worktrees: Map<number, string>,
 ): Promise<void> {
+  if (state.local) return;
+
   const pendingPRs = getPendingRalphPRs(state.mainRepo);
   if (pendingPRs.length === 0) {
     log("No pending ralph PRs found.", "OK");

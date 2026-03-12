@@ -39,14 +39,16 @@ function initState(config: Config): OrchestratorState {
     worktreeRoot,
     logDir,
     submodules,
+    local: config.local,
     claimedTasks: new Map(),
     claimedSubTasks: new Map(),
     completedTasks: new Set(),
   };
 }
 
-function validatePrerequisites(): boolean {
-  for (const cmd of ["claude", "git", "gh"]) {
+function validatePrerequisites(local = false): boolean {
+  const required = local ? ["claude", "git"] : ["claude", "git", "gh"];
+  for (const cmd of required) {
     if (!commandExists(cmd)) {
       console.error(`Required command not found: ${cmd}`);
       return false;
@@ -60,12 +62,18 @@ export async function runCleanup(config: Config): Promise<void> {
   mkdirSync(state.worktreeRoot, { recursive: true });
   mkdirSync(state.logDir, { recursive: true });
 
-  log("Merging pending PRs before cleanup...");
-  await drainPendingPRs(state, null, new Map());
+  if (!state.local) {
+    log("Merging pending PRs before cleanup...");
+    await drainPendingPRs(state, null, new Map());
+  }
   removeAllWorktrees(state);
 }
 
 export async function runMergeOnly(config: Config): Promise<void> {
+  if (config.local) {
+    log("Nothing to do in --merge-only with --local (no remote PRs to merge)");
+    return;
+  }
   if (!validatePrerequisites()) return;
 
   const state = initState(config);
@@ -97,7 +105,7 @@ export async function runMergeOnly(config: Config): Promise<void> {
 }
 
 export async function runMain(config: Config): Promise<void> {
-  if (!validatePrerequisites()) return;
+  if (!validatePrerequisites(config.local)) return;
   if (config.workers < 1) {
     console.log("Usage: ralph [--workers N] [--iterations-per-worker N] [--base-branch branch]");
     return;
@@ -107,7 +115,7 @@ export async function runMain(config: Config): Promise<void> {
 
   log("=== Ralph Parallel ===");
   log(`Workers: ${config.workers} | Iterations/worker: ${config.iterationsPerWorker} | Total budget: ${config.workers * config.iterationsPerWorker}`);
-  log(`Base branch: ${state.baseBranch} | Main repo: ${state.mainRepo}`);
+  log(`Base branch: ${state.baseBranch} | Main repo: ${state.mainRepo}${state.local ? " | Mode: LOCAL (no pushes/PRs)" : ""}`);
   console.log();
 
   mkdirSync(state.worktreeRoot, { recursive: true });
@@ -177,14 +185,16 @@ export async function runMain(config: Config): Promise<void> {
       return;
     }
 
-    // Setup merge worktree
-    log("--- Merge worker setup ---");
-    mergeWorktreePath = newMergeWorktree(state);
-    if (mergeWorktreePath) {
-      initializeSubmodules(state, mergeWorktreePath);
-      patchClaudeMD(state, mergeWorktreePath);
-    } else {
-      log("Merge worktree creation failed, merge reviews will be skipped", "WARN");
+    // Setup merge worktree (skip in local mode — no PRs to merge)
+    if (!state.local) {
+      log("--- Merge worker setup ---");
+      mergeWorktreePath = newMergeWorktree(state);
+      if (mergeWorktreePath) {
+        initializeSubmodules(state, mergeWorktreePath);
+        patchClaudeMD(state, mergeWorktreePath);
+      } else {
+        log("Merge worktree creation failed, merge reviews will be skipped", "WARN");
+      }
     }
 
     // Repair invalid Done cards
@@ -203,7 +213,7 @@ export async function runMain(config: Config): Promise<void> {
         continue;
       }
 
-      switchWorktreeToTaskBranch(path, claim.taskId, state.baseBranch);
+      switchWorktreeToTaskBranch(path, claim.taskId, state.baseBranch, state.local);
       syncKanbnToWorktree(state.mainRepo, path);
       const logFile = join(state.logDir, `worker-${w}.log`);
 
@@ -401,7 +411,7 @@ export async function runMain(config: Config): Promise<void> {
                 gitInDir(workerPath, "checkout", "--", ".");
                 gitInDir(workerPath, "clean", "-fd");
                 gitInDir(workerPath, "reset", "--hard", state.baseBranch);
-                switchWorktreeToTaskBranch(workerPath, jobInfo.taskId, state.baseBranch);
+                switchWorktreeToTaskBranch(workerPath, jobInfo.taskId, state.baseBranch, state.local);
               }
 
               log(`Worker ${workerId} continuing on task: ${jobInfo.taskId}`);
@@ -416,12 +426,12 @@ export async function runMain(config: Config): Promise<void> {
           }
         }
 
-        // Try instant merge of pending PRs
+        // Try instant merge of pending PRs (skip in local mode)
         if (!dispatched) {
           const ncKey = `${jobInfo.taskId}::${jobInfo.claimedSubTask ?? ""}`;
           noCommitCounts.delete(ncKey);
 
-          if (mergeWorktreePath) {
+          if (!state.local && mergeWorktreePath) {
             const pendingPRs = getPendingRalphPRs(state.mainRepo);
             for (const pr of pendingPRs) {
               log(`Worker ${workerId}: attempting merge of PR #${pr.number} (${pr.headRefName})...`);
@@ -436,7 +446,7 @@ export async function runMain(config: Config): Promise<void> {
         if (!dispatched) {
           const nextClaim = await claimNextTask(state, workerId, worktrees);
           if (nextClaim && workerPath) {
-            switchWorktreeToTaskBranch(workerPath, nextClaim.taskId, state.baseBranch);
+            switchWorktreeToTaskBranch(workerPath, nextClaim.taskId, state.baseBranch, state.local);
             syncKanbnToWorktree(state.mainRepo, workerPath);
             const logFile = join(state.logDir, `worker-${workerId}.log`);
             const { promise, process: child } = spawnWorker(workerId, workerPath, nextClaim.taskId, nextClaim.claimedSubTask, logFile, state.baseBranch);
@@ -540,23 +550,25 @@ export async function runMain(config: Config): Promise<void> {
       // Prune merged branches
       pruneMergedRalphBranches(state);
 
-      // Delete remaining local ralph/* branches
+      // Delete remaining local ralph/* branches (push unpushed work first unless local)
       const { stdout: localBranches } = gitSync(state.mainRepo, "branch", "--list", "ralph/*");
       if (localBranches) {
         for (const branchLine of localBranches.split("\n")) {
           const branch = branchLine.trim().replace(/^\* /, "");
           if (!branch || /^ralph\/worker-\d+$/.test(branch)) continue;
 
-          const { stdout: ahead } = gitSync(state.mainRepo, "log", "--oneline", `origin/${branch}..${branch}`);
-          if (!ahead) {
-            const { stdout: aheadMaster } = gitSync(state.mainRepo, "log", "--oneline", `master..${branch}`);
-            if (aheadMaster) {
+          if (!state.local) {
+            const { stdout: ahead } = gitSync(state.mainRepo, "log", "--oneline", `origin/${branch}..${branch}`);
+            if (!ahead) {
+              const { stdout: aheadMaster } = gitSync(state.mainRepo, "log", "--oneline", `master..${branch}`);
+              if (aheadMaster) {
+                log(`  Pushing unpushed work on ${branch} before cleanup`);
+                gitSync(state.mainRepo, "push", "origin", `${branch}:${branch}`, "--force");
+              }
+            } else {
               log(`  Pushing unpushed work on ${branch} before cleanup`);
               gitSync(state.mainRepo, "push", "origin", `${branch}:${branch}`, "--force");
             }
-          } else {
-            log(`  Pushing unpushed work on ${branch} before cleanup`);
-            gitSync(state.mainRepo, "push", "origin", `${branch}:${branch}`, "--force");
           }
 
           gitSync(state.mainRepo, "branch", "-D", branch);

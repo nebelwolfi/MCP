@@ -6,6 +6,7 @@ export interface Config {
   skipBuild: boolean;
   cleanup: boolean;
   mergeOnly: boolean;
+  local: boolean;
   baseBranch: string;
   projectDir: string;
 }
@@ -65,6 +66,7 @@ export interface OrchestratorState {
   worktreeRoot: string;
   logDir: string;
   submodules: string[];
+  local: boolean;
   claimedTasks: Map<string, number>;
   claimedSubTasks: Map<string, string>;
   completedTasks: Set<string>;

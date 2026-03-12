@@ -202,7 +202,7 @@ export function removeAllWorktrees(state: OrchestratorState): void {
   log("Cleanup complete", "OK");
 }
 
-export function switchWorktreeToTaskBranch(worktreePath: string, taskId: string, baseBranch: string): void {
+export function switchWorktreeToTaskBranch(worktreePath: string, taskId: string, baseBranch: string, local = false): void {
   // Save uncommitted work
   const { stdout: dirty } = gitInDir(worktreePath, "status", "--porcelain");
   if (dirty) {
@@ -220,7 +220,9 @@ export function switchWorktreeToTaskBranch(worktreePath: string, taskId: string,
   }
 
   const taskBranch = `ralph/${taskId}`;
-  gitInDir(worktreePath, "fetch", "origin", baseBranch, taskBranch);
+  if (!local) {
+    gitInDir(worktreePath, "fetch", "origin", baseBranch, taskBranch);
+  }
 
   // Unmark assume-unchanged on .kanbn files
   const { stdout: kanbnFiles } = gitInDir(worktreePath, "ls-files", ".kanbn");
@@ -239,7 +241,7 @@ export function switchWorktreeToTaskBranch(worktreePath: string, taskId: string,
       log(`  Failed to checkout ${taskBranch}: ${stdout}`, "ERROR");
       return;
     }
-  } else {
+  } else if (!local) {
     // Check if remote branch exists
     const { exitCode: remoteExists } = gitInDir(worktreePath, "rev-parse", "--verify", `origin/${taskBranch}`);
     if (remoteExists === 0) {
@@ -255,6 +257,13 @@ export function switchWorktreeToTaskBranch(worktreePath: string, taskId: string,
         log(`  Failed to create ${taskBranch}: ${stdout}`, "ERROR");
         return;
       }
+    }
+  } else {
+    // Local mode: create branch from local base
+    const { exitCode, stdout } = gitInDir(worktreePath, "checkout", "-b", taskBranch, baseBranch);
+    if (exitCode !== 0) {
+      log(`  Failed to create ${taskBranch}: ${stdout}`, "ERROR");
+      return;
     }
   }
 }
@@ -298,7 +307,9 @@ export function ensureUnionMergeForProgressTxt(state: OrchestratorState): void {
   if (needsCommit) {
     gitSync(state.mainRepo, "add", ".gitattributes");
     gitSync(state.mainRepo, "commit", "-m", "chore: add union merge strategy for progress.txt");
-    gitSync(state.mainRepo, "push", "origin", state.baseBranch);
+    if (!state.local) {
+      gitSync(state.mainRepo, "push", "origin", state.baseBranch);
+    }
     log("Added .gitattributes with union merge for progress.txt", "OK");
   }
 }
@@ -317,6 +328,8 @@ export function stopAllWorkerProcesses(worktreeRoot: string): void {
 }
 
 export function pruneMergedRalphBranches(state: OrchestratorState): void {
+  if (state.local) return;
+
   gitSync(state.mainRepo, "fetch", "origin", "--prune");
 
   let pruned = 0;

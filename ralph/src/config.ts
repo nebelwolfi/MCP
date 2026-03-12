@@ -12,7 +12,7 @@ function hasFlag(args: string[], name: string): boolean {
 
 const KNOWN_FLAGS = new Set([
   "help", "h", "workers", "iterations-per-worker", "skip-build",
-  "cleanup", "merge-only", "base-branch", "project-dir",
+  "cleanup", "merge-only", "local", "base-branch", "project-dir",
 ]);
 
 function printHelp(): never {
@@ -26,6 +26,7 @@ Options:
   --skip-build               Skip cmake configure step
   --cleanup                  Clean up worktrees and exit
   --merge-only               Only drain pending PRs, no task work
+  --local                    Run entirely locally (no pushes, PRs, or gh calls)
   --base-branch NAME         Base branch (default: auto-detect)
   --project-dir PATH         Project directory (default: cwd)`);
   process.exit(0);
@@ -53,6 +54,7 @@ export function parseArgs(argv: string[]): Config {
     skipBuild: hasFlag(args, "skip-build"),
     cleanup: hasFlag(args, "cleanup"),
     mergeOnly: hasFlag(args, "merge-only"),
+    local: hasFlag(args, "local"),
     baseBranch: flag(args, "base-branch") ?? "",
     projectDir: flag(args, "project-dir") ?? process.cwd(),
   };
