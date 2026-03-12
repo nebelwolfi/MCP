@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-export const server = new McpServer({ name: "convert-mcp", version: "1.0.0" });
+export const server = new McpServer({ name: "converter", version: "1.0.0" });
 
 const wrap = (fn: (params: Record<string, unknown>) => string) =>
   async (params: Record<string, unknown>) => {

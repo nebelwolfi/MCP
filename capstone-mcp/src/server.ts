@@ -4,7 +4,7 @@ import { Capstone, Const, loadCapstone } from "capstone-wasm";
 import { readFile } from "node:fs/promises";
 import { resolve, isAbsolute } from "node:path";
 
-export const server = new McpServer({ name: "capstone-mcp", version: "1.0.0" });
+export const server = new McpServer({ name: "capstone", version: "1.0.0" });
 
 const ARCHS: Record<string, { value: number; modes: Record<string, number> }> = {
   x86: {

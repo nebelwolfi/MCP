@@ -1,15 +1,19 @@
-import { readFile, writeFile, readdir, mkdir, unlink, access } from "node:fs/promises";
+import { readFile, writeFile, readdir, mkdir, rm, access } from "node:fs/promises";
 import { openSync, closeSync, unlinkSync } from "node:fs";
-import { basename } from "node:path";
+import { basename, join } from "node:path";
 import type { Task, BoardIndex } from "./types.js";
-import { TASKS_DIR, INDEX_FILE, DEFAULT_COLUMNS } from "./constants.js";
-import { cwd, kanbanPath, now, sanitizeCP1252 } from "./helpers.js";
-import { parseFrontmatter, toMarkdown, parseSubtasks, parseRelations, serializeBody } from "./parsers.js";
+import { TASKS_DIR, CONFIG_FILE, TASKS_INDEX_FILE, VERSION_FILE, BOARD_VERSION, DEFAULT_COLUMNS } from "./constants.js";
+import { cwd, boardPath, now } from "./helpers.js";
+import { parseFrontmatter, toMarkdown, parseSubtasks, parseRelations, serializeSubtasks, serializeRelations } from "./parsers.js";
 
 const LOCK_FILE = ".lock";
+const OLD_KANBN_DIR = ".kanbn";
+
+// ── Locking ────────────────────────────────────────────────────────────
 
 export async function withLock<T>(fn: () => Promise<T>): Promise<T> {
-  const lockPath = kanbanPath(LOCK_FILE);
+  const lockPath = boardPath(LOCK_FILE);
+  await mkdir(boardPath(), { recursive: true });
   const deadline = Date.now() + 10_000;
 
   while (true) {
@@ -33,24 +37,56 @@ export async function withLock<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+// ── Board existence ────────────────────────────────────────────────────
+
 export async function boardExists(): Promise<boolean> {
-  try { await access(kanbanPath(INDEX_FILE)); return true; } catch { return false; }
+  try { await access(boardPath(CONFIG_FILE)); return true; } catch { return false; }
 }
 
-export async function readIndex(): Promise<BoardIndex> {
-  const content = await readFile(kanbanPath(INDEX_FILE), "utf-8");
+// ── Config (config.md) ─────────────────────────────────────────────────
+
+export async function readConfig(): Promise<{ name: string; startedColumns: string[]; completedColumns: string[] }> {
+  const content = await readFile(boardPath(CONFIG_FILE), "utf-8");
   const { frontmatter, body } = parseFrontmatter(content);
 
   const nameMatch = body.match(/^# (.+)$/m);
   const name = nameMatch ? nameMatch[1].trim() : basename(cwd());
 
+  return {
+    name,
+    startedColumns: Array.isArray(frontmatter.startedColumns) ? frontmatter.startedColumns as string[] : [],
+    completedColumns: Array.isArray(frontmatter.completedColumns) ? frontmatter.completedColumns as string[] : [],
+  };
+}
+
+export async function writeConfig(config: { name: string; startedColumns: string[]; completedColumns: string[] }): Promise<void> {
+  await mkdir(boardPath(), { recursive: true });
+
+  const fm: Record<string, string[]> = {};
+  if (config.startedColumns?.length) fm.startedColumns = config.startedColumns;
+  if (config.completedColumns?.length) fm.completedColumns = config.completedColumns;
+
+  const body = `# ${config.name}`;
+  await writeFile(boardPath(CONFIG_FILE), toMarkdown(fm, body));
+}
+
+// ── Tasks index (tasks.md) ─────────────────────────────────────────────
+
+interface TasksIndex {
+  columns: string[];
+  tasksByColumn: Record<string, { id: string; title: string }[]>;
+}
+
+export async function readTasksIndex(): Promise<TasksIndex> {
+  const content = await readFile(boardPath(TASKS_INDEX_FILE), "utf-8");
+
   const columns: string[] = [];
-  const tasksByColumn: Record<string, string[]> = {};
+  const tasksByColumn: Record<string, { id: string; title: string }[]> = {};
   const h2Regex = /^## (.+)$/gm;
   const h2Positions: { name: string; start: number; end: number }[] = [];
   let m: RegExpExecArray | null;
 
-  while ((m = h2Regex.exec(body)) !== null) {
+  while ((m = h2Regex.exec(content)) !== null) {
     h2Positions.push({ name: m[1].trim(), start: m.index, end: m.index + m[0].length });
   }
 
@@ -59,77 +95,115 @@ export async function readIndex(): Promise<BoardIndex> {
     columns.push(col);
     tasksByColumn[col] = [];
 
-    const sectionText = body.slice(
+    const sectionText = content.slice(
       h2Positions[i].end,
-      i + 1 < h2Positions.length ? h2Positions[i + 1].start : body.length
+      i + 1 < h2Positions.length ? h2Positions[i + 1].start : content.length
     );
 
-    const linkRegex = /^- \[([^\]]+)\]\(tasks\/[^)]+\.md\)/gm;
+    // Match: - [Title](tasks/{hash}/task.md)
+    const linkRegex = /^- \[([^\]]+)\]\(tasks\/([^/]+)\/task\.md\)/gm;
     let lm: RegExpExecArray | null;
     while ((lm = linkRegex.exec(sectionText)) !== null) {
-      tasksByColumn[col].push(lm[1]);
+      tasksByColumn[col].push({ id: lm[2], title: lm[1] });
     }
   }
 
+  return { columns, tasksByColumn };
+}
+
+export async function writeTasksIndex(columns: string[], tasksByColumn: Record<string, string[]>, titleMap: Record<string, string>): Promise<void> {
+  await mkdir(boardPath(), { recursive: true });
+
+  let body = "";
+  for (const col of columns) {
+    const tasks = tasksByColumn[col] ?? [];
+    body += `## ${col}\n`;
+    if (tasks.length > 0) {
+      body += "\n";
+      for (const id of tasks) {
+        const title = titleMap[id] ?? id;
+        body += `- [${title}](tasks/${id}/task.md)\n`;
+      }
+    }
+    body += "\n";
+  }
+
+  await writeFile(boardPath(TASKS_INDEX_FILE), body);
+}
+
+// ── Combined index (merges config + tasks index) ───────────────────────
+
+export async function readIndex(): Promise<BoardIndex> {
+  const config = await readConfig();
+  const tasksIdx = await readTasksIndex();
+
+  // Convert { id, title }[] to just id[]
+  const tasksByColumn: Record<string, string[]> = {};
+  for (const [col, tasks] of Object.entries(tasksIdx.tasksByColumn)) {
+    tasksByColumn[col] = tasks.map((t) => t.id);
+  }
+
   return {
-    name,
-    columns,
+    name: config.name,
+    columns: tasksIdx.columns,
     tasksByColumn,
-    startedColumns: Array.isArray(frontmatter.startedColumns) ? frontmatter.startedColumns as string[] : [],
-    completedColumns: Array.isArray(frontmatter.completedColumns) ? frontmatter.completedColumns as string[] : [],
+    startedColumns: config.startedColumns,
+    completedColumns: config.completedColumns,
   };
 }
 
 export async function writeIndex(index: BoardIndex): Promise<void> {
-  await mkdir(kanbanPath(), { recursive: true });
+  await writeConfig({
+    name: index.name,
+    startedColumns: index.startedColumns,
+    completedColumns: index.completedColumns,
+  });
 
-  const fm: Record<string, string[]> = {};
-  if (index.startedColumns?.length) fm.startedColumns = index.startedColumns;
-  if (index.completedColumns?.length) fm.completedColumns = index.completedColumns;
-
-  let body = `# ${index.name}\n`;
-  for (const col of index.columns) {
-    const tasks = index.tasksByColumn[col] ?? [];
-    body += `\n## ${col}\n`;
-    if (tasks.length > 0) {
-      body += "\n";
-      for (const id of tasks) body += `- [${id}](tasks/${id}.md)\n`;
+  // Build title map from task files (authoritative source for titles)
+  const titleMap: Record<string, string> = {};
+  for (const ids of Object.values(index.tasksByColumn)) {
+    for (const id of ids) {
+      if (!titleMap[id]) {
+        try {
+          const task = await readTask(id);
+          titleMap[id] = task.title;
+        } catch {
+          titleMap[id] = id;
+        }
+      }
     }
   }
 
-  await writeFile(kanbanPath(INDEX_FILE), sanitizeCP1252(toMarkdown(fm, body)));
+  await writeTasksIndex(index.columns, index.tasksByColumn, titleMap);
 }
 
-export async function ensureBoard(): Promise<void> {
-  if (await boardExists()) return;
-  await mkdir(kanbanPath(TASKS_DIR), { recursive: true });
-  await writeIndex({
-    name: basename(cwd()),
-    columns: [...DEFAULT_COLUMNS],
-    tasksByColumn: Object.fromEntries(DEFAULT_COLUMNS.map((c) => [c, []])),
-    startedColumns: ["In Progress"],
-    completedColumns: ["Done"],
-  });
+// ── Task I/O (folder-based) ────────────────────────────────────────────
+
+function taskDir(id: string): string {
+  return boardPath(TASKS_DIR, id);
+}
+
+async function readFileOrEmpty(path: string): Promise<string> {
+  try { return await readFile(path, "utf-8"); } catch { return ""; }
 }
 
 export async function readTask(id: string): Promise<Task> {
-  const content = await readFile(kanbanPath(TASKS_DIR, `${id}.md`), "utf-8");
-  const { frontmatter, body } = parseFrontmatter(content);
+  const taskMd = await readFile(join(taskDir(id), "task.md"), "utf-8");
+  const { frontmatter, body } = parseFrontmatter(taskMd);
 
   const titleMatch = body.match(/^# (.+)$/m);
   const title = titleMatch ? titleMatch[1].trim() : id;
 
-  const stripped = body.replace(/\n---\r?\n[\s\S]*?\r?\n---/g, "").trim();
-  const bodyWithoutTitle = stripped.replace(/^# .+\n*/, "").trim().replace(/^# .+\n*/, "").trim();
-  const { relations, body: bodyWithoutRelations } = parseRelations(bodyWithoutTitle);
-  const { subtasks, description } = parseSubtasks(bodyWithoutRelations);
+  const detailsContent = await readFileOrEmpty(join(taskDir(id), "details.md"));
+  const subtasksContent = await readFileOrEmpty(join(taskDir(id), "subtasks.md"));
+  const relationsContent = await readFileOrEmpty(join(taskDir(id), "relations.md"));
 
   return {
     id,
     title,
-    description: description.trim(),
-    subtasks,
-    relations,
+    description: detailsContent.trim(),
+    subtasks: parseSubtasks(subtasksContent),
+    relations: parseRelations(relationsContent),
     created: (frontmatter.created as string) ?? now(),
     updated: (frontmatter.updated as string) ?? now(),
     started: frontmatter.started as string | undefined,
@@ -143,6 +217,10 @@ export async function readTask(id: string): Promise<Task> {
 }
 
 export async function writeTask(task: Task): Promise<void> {
+  const dir = taskDir(task.id);
+  await mkdir(dir, { recursive: true });
+
+  // task.md — frontmatter + title
   const fm: Record<string, string | string[]> = {
     created: task.created ?? now(),
     updated: now(),
@@ -153,15 +231,23 @@ export async function writeTask(task: Task): Promise<void> {
   if (task.assignee)  fm.assignee  = task.assignee;
   if (task.tags?.length) fm.tags   = task.tags;
 
-  const content = serializeBody(task.description, task.subtasks, task.relations);
-  const body = `# ${task.title}` + (content ? `\n\n${content}` : "");
+  await writeFile(join(dir, "task.md"), toMarkdown(fm, `# ${task.title}`));
 
-  await writeFile(kanbanPath(TASKS_DIR, `${task.id}.md`), sanitizeCP1252(toMarkdown(fm, body)));
+  // details.md
+  await writeFile(join(dir, "details.md"), task.description || "");
+
+  // subtasks.md
+  await writeFile(join(dir, "subtasks.md"), serializeSubtasks(task.subtasks ?? []));
+
+  // relations.md
+  await writeFile(join(dir, "relations.md"), serializeRelations(task.relations ?? []));
 }
 
 export async function deleteTaskFile(id: string): Promise<void> {
-  await unlink(kanbanPath(TASKS_DIR, `${id}.md`));
+  await rm(taskDir(id), { recursive: true, force: true });
 }
+
+// ── Listing helpers ────────────────────────────────────────────────────
 
 export async function listTaskIds(): Promise<string[]> {
   try {
@@ -177,7 +263,7 @@ export async function getAllTasksWithColumns(): Promise<{ tasks: (Task & { colum
     for (const id of (index.tasksByColumn[col] ?? [])) {
       try {
         tasks.push({ ...(await readTask(id)), column: col });
-      } catch { /* skip missing files */ }
+      } catch { /* skip missing */ }
     }
   }
   return { tasks, index };
@@ -185,11 +271,190 @@ export async function getAllTasksWithColumns(): Promise<{ tasks: (Task & { colum
 
 export async function listOrphanedFiles(): Promise<string[]> {
   try {
-    const files = await readdir(kanbanPath(TASKS_DIR));
+    const entries = await readdir(boardPath(TASKS_DIR), { withFileTypes: true });
     const index = await readIndex();
     const indexed = new Set(index.columns.flatMap((c) => index.tasksByColumn[c] ?? []));
-    return files
-      .filter((f) => f.endsWith(".md"))
-      .filter((f) => !indexed.has(f.replace(".md", "")));
+    return entries
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name)
+      .filter((name) => !indexed.has(name));
   } catch { return []; }
+}
+
+// ── Board initialization + auto-migration ──────────────────────────────
+
+export async function ensureBoard(): Promise<void> {
+  if (await boardExists()) return;
+
+  // Check for old-format board to migrate
+  const oldIndexPath = join(cwd(), OLD_KANBN_DIR, "index.md");
+  try {
+    await access(oldIndexPath);
+    await migrateFromV0(join(cwd(), OLD_KANBN_DIR));
+    return;
+  } catch { /* no old board, create fresh */ }
+
+  await mkdir(boardPath(TASKS_DIR), { recursive: true });
+  await writeFile(boardPath(VERSION_FILE), BOARD_VERSION);
+  await writeConfig({
+    name: basename(cwd()),
+    startedColumns: ["In Progress"],
+    completedColumns: ["Done"],
+  });
+  await writeTasksIndex(
+    [...DEFAULT_COLUMNS],
+    Object.fromEntries(DEFAULT_COLUMNS.map((c) => [c, []])),
+    {}
+  );
+}
+
+// ── Migration from v0 (.kanbn/) ────────────────────────────────────────
+
+async function migrateFromV0(oldRoot: string): Promise<void> {
+  const { generateTaskId } = await import("./helpers.js");
+
+  // Read old index
+  const oldIndexContent = await readFile(join(oldRoot, "index.md"), "utf-8");
+  const { frontmatter, body } = parseFrontmatter(oldIndexContent);
+
+  const nameMatch = body.match(/^# (.+)$/m);
+  const name = nameMatch ? nameMatch[1].trim() : basename(cwd());
+
+  const startedColumns = Array.isArray(frontmatter.startedColumns) ? frontmatter.startedColumns as string[] : [];
+  const completedColumns = Array.isArray(frontmatter.completedColumns) ? frontmatter.completedColumns as string[] : [];
+
+  // Parse old columns and task IDs
+  const columns: string[] = [];
+  const oldTasksByColumn: Record<string, string[]> = {};
+  const h2Regex = /^## (.+)$/gm;
+  const h2Positions: { name: string; start: number; end: number }[] = [];
+  let m: RegExpExecArray | null;
+
+  while ((m = h2Regex.exec(body)) !== null) {
+    h2Positions.push({ name: m[1].trim(), start: m.index, end: m.index + m[0].length });
+  }
+
+  for (let i = 0; i < h2Positions.length; i++) {
+    const col = h2Positions[i].name;
+    columns.push(col);
+    oldTasksByColumn[col] = [];
+
+    const sectionText = body.slice(
+      h2Positions[i].end,
+      i + 1 < h2Positions.length ? h2Positions[i + 1].start : body.length
+    );
+
+    const linkRegex = /^- \[([^\]]+)\]\(tasks\/[^)]+\.md\)/gm;
+    let lm: RegExpExecArray | null;
+    while ((lm = linkRegex.exec(sectionText)) !== null) {
+      oldTasksByColumn[col].push(lm[1]);
+    }
+  }
+
+  // Create new board structure
+  await mkdir(boardPath(TASKS_DIR), { recursive: true });
+  await writeFile(boardPath(VERSION_FILE), BOARD_VERSION);
+  await writeConfig({ name, startedColumns, completedColumns });
+
+  // Migrate tasks: read old files, assign new IDs
+  const oldToNewId: Record<string, string> = {};
+  const titleMap: Record<string, string> = {};
+  const migratedTasks: Task[] = [];
+
+  for (const col of columns) {
+    for (const oldId of (oldTasksByColumn[col] ?? [])) {
+      try {
+        const oldContent = await readFile(join(oldRoot, "tasks", `${oldId}.md`), "utf-8");
+        const { frontmatter: taskFm, body: taskBody } = parseFrontmatter(oldContent);
+
+        const titleMatch = taskBody.match(/^# (.+)$/m);
+        const title = titleMatch ? titleMatch[1].trim() : oldId;
+
+        // Parse old-format body (has ## Sub-tasks and ## Relations inline)
+        const stripped = taskBody.replace(/\n---\r?\n[\s\S]*?\r?\n---/g, "").trim();
+        const bodyWithoutTitle = stripped.replace(/^# .+\n*/, "").trim().replace(/^# .+\n*/, "").trim();
+
+        // Extract relations (old format)
+        const relMatch = bodyWithoutTitle.match(/\n*## Relations\r?\n([\s\S]*?)(?:\n## |\s*$)/);
+        let relationsRaw: { type: string; taskId: string }[] = [];
+        let bodyNoRelations = bodyWithoutTitle;
+        if (relMatch) {
+          for (const line of relMatch[1].split("\n")) {
+            const linkM = line.match(/^- \[([^\]]+)\]\([^)]+\)$/);
+            const bracketM = !linkM && line.match(/^- \[([^\]]+)\]$/);
+            const text = linkM ? linkM[1].trim() : bracketM ? bracketM[1].trim() : null;
+            if (!text) continue;
+            const parts = text.split(" ");
+            const type = parts.length > 1 ? parts[0] : "";
+            const taskId = parts.length > 1 ? parts.slice(1).join(" ") : parts[0];
+            relationsRaw.push({ type, taskId });
+          }
+          bodyNoRelations = bodyWithoutTitle.replace(/\n*## Relations[\s\S]*?(?:\n## |$)/, "").trim();
+        }
+
+        // Extract subtasks (old format)
+        const subMatch = bodyNoRelations.match(/## Sub-tasks\r?\n([\s\S]*?)(?:\n## |\n*$)/);
+        let subtasks: { text: string; completed: boolean }[] = [];
+        let description = bodyNoRelations;
+        if (subMatch) {
+          for (const line of subMatch[1].split("\n")) {
+            const sm = line.match(/^- \[([ xX])\] (.+)$/);
+            if (sm) subtasks.push({ text: sm[2].trim(), completed: sm[1] !== " " });
+          }
+          description = bodyNoRelations.replace(/\n*## Sub-tasks[\s\S]*/, "").trim();
+        }
+
+        const newId = generateTaskId();
+        oldToNewId[oldId] = newId;
+        titleMap[newId] = title;
+
+        migratedTasks.push({
+          id: newId,
+          title,
+          description,
+          subtasks,
+          relations: relationsRaw,
+          created: (taskFm.created as string) ?? now(),
+          updated: (taskFm.updated as string) ?? now(),
+          started: taskFm.started as string | undefined,
+          completed: taskFm.completed as string | undefined,
+          priority: (taskFm.priority as Task["priority"]) ?? "medium",
+          assignee: (taskFm.assignee as string) ?? "",
+          tags: Array.isArray(taskFm.tags)
+            ? taskFm.tags as string[]
+            : taskFm.tags ? [taskFm.tags as string] : [],
+        });
+      } catch { /* skip unreadable tasks */ }
+    }
+  }
+
+  // Remap relation taskIds from old to new
+  for (const task of migratedTasks) {
+    for (const rel of task.relations) {
+      if (oldToNewId[rel.taskId]) {
+        rel.taskId = oldToNewId[rel.taskId];
+      }
+    }
+  }
+
+  // Write migrated tasks
+  for (const task of migratedTasks) {
+    await writeTask(task);
+  }
+
+  // Write tasks index with new IDs
+  const newTasksByColumn: Record<string, string[]> = {};
+  for (const col of columns) {
+    newTasksByColumn[col] = (oldTasksByColumn[col] ?? [])
+      .map((oldId) => oldToNewId[oldId])
+      .filter(Boolean);
+  }
+
+  await writeTasksIndex(columns, newTasksByColumn, titleMap);
+
+  // Rename old board to .kanbn.bak
+  const { rename } = await import("node:fs/promises");
+  try {
+    await rename(oldRoot, oldRoot.replace(/\.kanbn$/, ".kanbn.bak"));
+  } catch { /* best effort */ }
 }

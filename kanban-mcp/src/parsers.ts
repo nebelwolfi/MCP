@@ -67,26 +67,20 @@ export function toMarkdown(fm: Frontmatter, body: string): string {
   return `---\n${yaml}---\n${body ? "\n" + body + "\n" : ""}`;
 }
 
-export function parseSubtasks(body: string): { subtasks: Subtask[]; description: string } {
-  const match = body.match(/## Sub-tasks\r?\n([\s\S]*?)(?=\n## |\n*$)/);
-  if (!match) return { subtasks: [], description: body.trim() };
-
+/** Parse subtasks from standalone subtasks.md (plain checkbox lines, no ## header) */
+export function parseSubtasks(content: string): Subtask[] {
   const subtasks: Subtask[] = [];
-  for (const line of match[1].split("\n")) {
+  for (const line of content.split("\n")) {
     const m = line.match(/^- \[([ xX])\] (.+)$/);
     if (m) subtasks.push({ text: m[2].trim(), completed: m[1] !== " " });
   }
-
-  const description = body.replace(/\n*## Sub-tasks[\s\S]*/, "").trim();
-  return { subtasks, description };
+  return subtasks;
 }
 
-export function parseRelations(body: string): { relations: Relation[]; body: string } {
-  const match = body.match(/\n*## Relations\r?\n([\s\S]*?)(?=\n## |\s*$)/);
-  if (!match) return { relations: [], body };
-
+/** Parse relations from standalone relations.md (plain relation lines, no ## header) */
+export function parseRelations(content: string): Relation[] {
   const relations: Relation[] = [];
-  for (const line of match[1].split("\n")) {
+  for (const line of content.split("\n")) {
     const linkM = line.match(/^- \[([^\]]+)\]\([^)]+\)$/);
     const bracketM = !linkM && line.match(/^- \[([^\]]+)\]$/);
     const text = linkM ? linkM[1].trim() : bracketM ? bracketM[1].trim() : null;
@@ -96,26 +90,18 @@ export function parseRelations(body: string): { relations: Relation[]; body: str
     const taskId = parts.length > 1 ? parts.slice(1).join(" ") : parts[0];
     relations.push({ type, taskId });
   }
-
-  const cleanBody = body.replace(/\n*## Relations[\s\S]*?(?=\n## |$)/, "").trim();
-  return { relations, body: cleanBody };
+  return relations;
 }
 
-export function serializeBody(description: string, subtasks?: Subtask[], relations?: Relation[]): string {
-  let body = description || "";
-  if (subtasks && subtasks.length > 0) {
-    if (body) body += "\n\n";
-    body += "## Sub-tasks\n";
-    for (const st of subtasks)
-      body += `- [${st.completed ? "x" : " "}] ${st.text}\n`;
-  }
-  if (relations && relations.length > 0) {
-    if (body) body += "\n\n";
-    body += "## Relations\n";
-    for (const r of relations) {
-      const label = r.type ? `${r.type} ${r.taskId}` : r.taskId;
-      body += `- [${label}](${r.taskId}.md)\n`;
-    }
-  }
-  return body;
+export function serializeSubtasks(subtasks: Subtask[]): string {
+  if (subtasks.length === 0) return "";
+  return subtasks.map((st) => `- [${st.completed ? "x" : " "}] ${st.text}`).join("\n") + "\n";
+}
+
+export function serializeRelations(relations: Relation[]): string {
+  if (relations.length === 0) return "";
+  return relations.map((r) => {
+    const label = r.type ? `${r.type} ${r.taskId}` : r.taskId;
+    return `- [${label}](${r.taskId}/task.md)`;
+  }).join("\n") + "\n";
 }

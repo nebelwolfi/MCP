@@ -2,9 +2,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { readIndex, readTask, ensureBoard } from "./storage.js";
 import { createTask, editTask, moveTask, deleteTask, findTasks } from "./operations.js";
-import { boardView, boardStats, boardValidate } from "./views.js";
+import { boardView } from "./views.js";
 
-export const server = new McpServer({ name: "kanban-mcp", version: "1.0.0" });
+export const server = new McpServer({ name: "kanban", version: "1.0.0" });
 
 const wrap = (fn: (params: Record<string, unknown>) => Promise<string>) =>
   async (params: Record<string, unknown>) => {
@@ -19,8 +19,6 @@ const wrap = (fn: (params: Record<string, unknown>) => Promise<string>) =>
   };
 
 server.tool("board_view", "Show the full kanban board with all columns and tasks", {}, wrap(boardView));
-server.tool("board_stats", "Board statistics: task counts, completion rate, priority breakdown", {}, wrap(boardStats));
-server.tool("board_validate", "Check board consistency and report issues", {}, wrap(boardValidate));
 
 server.tool("task_create", "Create a new task", {
   title:       z.string().describe("Task title"),

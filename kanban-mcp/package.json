@@ -6,14 +6,12 @@
   "main": "dist/index.js",
   "installConfig": {
     "displayName": "Kanban Board MCP",
-    "prerequisites": [],
-    "profileSetup": [
-      { "name": "Kanban-Open", "body": "function Kanban-Open { node \"{{entryDir}}/dist/web.js\" @args }" }
-    ]
+    "prerequisites": []
   },
   "bin": {
     "kanban-mcp": "dist/index.js",
-    "kanban-web": "dist/web.js"
+    "Kanban-Open": "dist/web.js",
+    "kanban": "dist/cli.js"
   },
   "scripts": {
     "build": "tsc && node -e \"require('fs').copyFileSync('src/app.html','dist/app.html')\"",

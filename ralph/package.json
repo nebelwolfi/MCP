@@ -1,0 +1,26 @@
+{
+  "name": "ralph",
+  "version": "1.0.0",
+  "description": "Parallel Claude worker orchestrator for kanban task processing",
+  "type": "module",
+  "main": "dist/index.js",
+  "installConfig": {
+    "displayName": "Ralph Worker Loop",
+    "componentType": "cli"
+  },
+  "bin": {
+    "Ralph-Loop": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepare": "npm run build",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "tree-kill": "^1.2.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}

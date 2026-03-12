@@ -1,5 +1,5 @@
 import type { Task, CreateTaskParams, FindTasksParams } from "./types.js";
-import { now, slugify } from "./helpers.js";
+import { now, generateTaskId } from "./helpers.js";
 import {
   ensureBoard, readIndex, writeIndex,
   readTask, writeTask, deleteTaskFile,
@@ -14,11 +14,7 @@ export async function createTask(params: CreateTaskParams): Promise<Task & { col
     if (!index.columns.includes(column))
       throw new Error(`Column "${column}" does not exist. Available: ${index.columns.join(", ")}`);
 
-    const existingIds = await listTaskIds();
-    const baseId = slugify(params.title) || `task-${Date.now().toString(36)}`;
-    let id = baseId;
-    let suffix = 1;
-    while (existingIds.includes(id)) id = `${baseId}-${++suffix}`;
+    const id = generateTaskId();
 
     const task: Task = {
       id,
@@ -47,10 +43,18 @@ export async function createTask(params: CreateTaskParams): Promise<Task & { col
 export async function editTask(id: string, updates: Partial<Pick<Task, "title" | "description" | "priority" | "assignee" | "tags">>): Promise<Task> {
   return withLock(async () => {
     const task = await readTask(id);
+    const titleChanged = updates.title !== undefined && updates.title !== task.title;
     for (const key of ["title", "description", "priority", "assignee", "tags"] as const) {
       if (updates[key] !== undefined) (task as unknown as Record<string, unknown>)[key] = updates[key];
     }
     await writeTask(task);
+
+    // If title changed, update the tasks index so it shows the new title
+    if (titleChanged) {
+      const index = await readIndex();
+      await writeIndex(index);
+    }
+
     return task;
   });
 }

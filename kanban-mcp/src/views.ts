@@ -73,7 +73,7 @@ export async function boardValidate(): Promise<string> {
   }
 
   const orphans = await listOrphanedFiles();
-  for (const f of orphans) issues.push(`Task file "${f}" is not referenced in the index`);
+  for (const f of orphans) issues.push(`Task folder "${f}" is not referenced in the index`);
 
   return issues.length === 0
     ? "Board is valid. No issues found."

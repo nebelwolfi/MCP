@@ -54,28 +54,17 @@ Get-ChildItem -Path $repoRoot -Directory | Where-Object { $_.Name -ne "node_modu
     $cfg = if ($json.installConfig) { $json.installConfig } else { $null }
     $displayName = if ($cfg -and $cfg.displayName) { $cfg.displayName } else { $name }
 
+    $componentType = if ($cfg -and $cfg.componentType) { $cfg.componentType } else { "mcp" }
     $components += @{
         Name        = $name
         DisplayName = $displayName
-        Type        = "mcp"
+        Type        = $componentType
         Dir         = $dir
         Config      = $cfg
         PackageJson = $json
     }
 }
 
-# ralph.ps1 as a standalone script component
-$ralphScript = Join-Path $repoRoot "ralph.ps1"
-if (Test-Path $ralphScript) {
-    $components += @{
-        Name        = "ralph"
-        DisplayName = "Ralph Worker Loop (ralph.ps1)"
-        Type        = "script"
-        Dir         = $repoRoot
-        Config      = $null
-        Script      = $ralphScript
-    }
-}
 
 # --- Select what to install ---
 $toInstall = @()
@@ -131,50 +120,74 @@ foreach ($comp in $toInstall) {
     Write-Host ""
     Write-Host "--- Installing $($comp.DisplayName) ---"
 
-    if ($comp.Type -eq "mcp") {
-        $cfg = $comp.Config
+    $cfg = $comp.Config
 
-        # Prerequisites
-        if ($cfg -and $cfg.prerequisites) {
-            foreach ($prereq in $cfg.prerequisites) {
-                $label = if ($prereq.label) { $prereq.label } else { $prereq.command }
-                if (-not (Get-Command $prereq.command -ErrorAction SilentlyContinue)) {
-                    Write-Host "  Installing prerequisite: $label..."
-                    Invoke-Expression $prereq.install
-                } else {
-                    Write-Host "  $label already installed."
-                }
+    # Prerequisites (shared across types)
+    if ($cfg -and $cfg.prerequisites) {
+        foreach ($prereq in $cfg.prerequisites) {
+            $label = if ($prereq.label) { $prereq.label } else { $prereq.command }
+            if (-not (Get-Command $prereq.command -ErrorAction SilentlyContinue)) {
+                Write-Host "  Installing prerequisite: $label..."
+                Invoke-Expression $prereq.install
+            } else {
+                Write-Host "  $label already installed."
             }
         }
+    }
 
+    if ($comp.Type -eq "mcp" -or $comp.Type -eq "cli") {
         # npm install + build
-        Write-Host "  npm install..."
+        Write-Host "  installing..."
         Push-Location $comp.Dir
         npm install --silent
         Pop-Location
 
-        # Register MCP server
-        $main = if ($comp.PackageJson.main) { $comp.PackageJson.main } else { "index.js" }
-        $entryPoint = Join-Path $comp.Dir $main
-        if (Test-Path $entryPoint) {
-            Write-Host "  Registering MCP server: $name -> $entryPoint"
-            claude mcp remove --scope user $name 2>$null
-            claude mcp add --scope user $name node $entryPoint
-        } else {
-            Write-Warning "  Entry point not found: $entryPoint - skipping MCP registration"
+        if ($comp.Type -eq "mcp") {
+            # Register MCP server
+            $main = if ($comp.PackageJson.main) { $comp.PackageJson.main } else { "index.js" }
+            $entryPoint = Join-Path $comp.Dir $main
+            if (Test-Path $entryPoint) {
+                Write-Host "  Registering MCP server: $name -> $entryPoint"
+                claude mcp remove --scope user $name 2>$null
+                claude mcp add --scope user $name node $entryPoint
+            } else {
+                Write-Warning "  Entry point not found: $entryPoint - skipping MCP registration"
+            }
         }
 
-        # Profile setup (functions, aliases, etc.)
-        if ($cfg -and $cfg.profileSetup) {
-            $profileContent = Get-Content $PROFILE -Raw
-            foreach ($setup in $cfg.profileSetup) {
-                $body = $setup.body.Replace('{{entryDir}}', $comp.Dir).Replace('{{repoRoot}}', $repoRoot)
-                if (-not $profileContent -or -not $profileContent.Contains($setup.name)) {
-                    Add-Content $PROFILE "`n$body"
-                    Write-Host "  Registered $($setup.name) in profile."
-                } else {
-                    Write-Host "  $($setup.name) already in profile."
+        # Register bin commands globally via npm link
+        if ($comp.PackageJson.bin) {
+            Write-Host "  Linking CLI commands globally..."
+            Push-Location $comp.Dir
+            npm link --silent 2>$null
+            Pop-Location
+            if ($LASTEXITCODE -eq 0) {
+                $binNames = ($comp.PackageJson.bin.PSObject.Properties | ForEach-Object { $_.Name }) -join ", "
+                Write-Host "  Linked: $binNames"
+            } else {
+                Write-Host "  npm link failed." -ForegroundColor Yellow
+            }
+        }
+
+        # Remove legacy profile functions that are now handled by npm link
+        $profileContent = Get-Content $PROFILE -Raw
+        if ($profileContent) {
+            $legacyPatterns = @()
+            if ($comp.PackageJson.bin) {
+                foreach ($binName in $comp.PackageJson.bin.PSObject.Properties.Name) {
+                    $legacyPatterns += [regex]::Escape($binName)
                 }
+            }
+            # Also clean up ralph.ps1 dot-source
+            $legacyPatterns += 'ralph\.ps1'
+
+            $cleaned = $profileContent
+            foreach ($pattern in $legacyPatterns) {
+                $cleaned = ($cleaned -split "`n" | Where-Object { $_ -notmatch "function\s+$pattern\s*\{" }) -join "`n"
+            }
+            if ($cleaned -ne $profileContent) {
+                Set-Content $PROFILE -Value $cleaned -NoNewline -Encoding UTF8
+                Write-Host "  Cleaned up legacy profile functions."
             }
         }
     }
