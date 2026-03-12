@@ -121,14 +121,28 @@ export async function runMain(config: Config): Promise<void> {
   let totalIterations = 0;
   let boardComplete = false;
   let shutdownRequested = false;
+  let forceShutdown = false;
   let mergeWorktreePath: string | null = null;
 
   // Handle Ctrl+C gracefully
-  process.on("SIGINT", () => {
+  process.on("SIGINT", async () => {
     if (!shutdownRequested) {
       shutdownRequested = true;
       log("", "WARN");
       log("Ctrl+C received -- waiting for running workers to finish...", "WARN");
+    } else if (!forceShutdown) {
+      forceShutdown = true;
+      log("Second Ctrl+C received -- killing active workers...", "WARN");
+      const treeKill = await import("tree-kill").then((m) => m.default).catch(() => null);
+      for (const child of childProcesses) {
+        if (child.pid && !child.killed) {
+          if (treeKill) {
+            treeKill(child.pid, "SIGTERM");
+          } else {
+            child.kill("SIGTERM");
+          }
+        }
+      }
     }
   });
 
@@ -443,7 +457,7 @@ export async function runMain(config: Config): Promise<void> {
 
     // Graceful shutdown: wait for remaining workers
     if (shutdownRequested || boardComplete) {
-      while (activeJobs.size > 0) {
+      while (activeJobs.size > 0 && !forceShutdown) {
         const settled = await Promise.race([
           ...[...activeJobs.entries()].map(([id, job]) =>
             job.promise.then((result) => ({ workerId: id, result })),
@@ -451,7 +465,10 @@ export async function runMain(config: Config): Promise<void> {
           delay(5000).then(() => null),
         ]);
 
-        if (!settled) continue;
+        if (!settled) {
+          if (forceShutdown) break;
+          continue;
+        }
 
         const { workerId, result } = settled;
         const jobInfo = activeJobs.get(workerId)!;
@@ -480,75 +497,79 @@ export async function runMain(config: Config): Promise<void> {
     }
 
   } finally {
-    // Phase 4: Cleanup
-    console.log();
-    log("Phase 4: Cleanup...");
+    if (forceShutdown) {
+      log("Force shutdown -- skipping cleanup (run with --cleanup to clean up later)", "WARN");
+    } else {
+      // Phase 4: Cleanup
+      console.log();
+      log("Phase 4: Cleanup...");
 
-    // Kill remaining child processes
-    const treeKill = await import("tree-kill").then((m) => m.default).catch(() => null);
-    for (const child of childProcesses) {
-      if (child.pid && !child.killed) {
-        if (treeKill) {
-          treeKill(child.pid, "SIGTERM");
-        } else {
-          child.kill("SIGTERM");
+      // Kill remaining child processes
+      const treeKill = await import("tree-kill").then((m) => m.default).catch(() => null);
+      for (const child of childProcesses) {
+        if (child.pid && !child.killed) {
+          if (treeKill) {
+            treeKill(child.pid, "SIGTERM");
+          } else {
+            child.kill("SIGTERM");
+          }
         }
       }
-    }
 
-    stopAllWorkerProcesses(state.worktreeRoot);
+      stopAllWorkerProcesses(state.worktreeRoot);
 
-    // Restore main repo to base branch
-    const { stdout: currentBranch } = gitSync(state.mainRepo, "rev-parse", "--abbrev-ref", "HEAD");
-    if (currentBranch && currentBranch !== state.baseBranch) {
-      log(`Restoring main repo from '${currentBranch}' to '${state.baseBranch}'`);
-      gitSync(state.mainRepo, "checkout", state.baseBranch);
-    }
+      // Restore main repo to base branch
+      const { stdout: currentBranch } = gitSync(state.mainRepo, "rev-parse", "--abbrev-ref", "HEAD");
+      if (currentBranch && currentBranch !== state.baseBranch) {
+        log(`Restoring main repo from '${currentBranch}' to '${state.baseBranch}'`);
+        gitSync(state.mainRepo, "checkout", state.baseBranch);
+      }
 
-    // Move uncompleted claimed tasks back
-    for (const [taskId] of state.claimedTasks) {
-      await moveKanbanTask(state.mainRepo, taskId, "In Progress");
-      await releaseTaskClaim(state,taskId);
-    }
+      // Move uncompleted claimed tasks back
+      for (const [taskId] of state.claimedTasks) {
+        await moveKanbanTask(state.mainRepo, taskId, "In Progress");
+        await releaseTaskClaim(state,taskId);
+      }
 
-    // Remove worktrees
-    for (const [w] of worktrees) {
-      removeRalphWorktree(state, w);
-    }
-    removeMergeWorktree(state);
+      // Remove worktrees
+      for (const [w] of worktrees) {
+        removeRalphWorktree(state, w);
+      }
+      removeMergeWorktree(state);
 
-    // Prune merged branches
-    pruneMergedRalphBranches(state);
+      // Prune merged branches
+      pruneMergedRalphBranches(state);
 
-    // Delete remaining local ralph/* branches
-    const { stdout: localBranches } = gitSync(state.mainRepo, "branch", "--list", "ralph/*");
-    if (localBranches) {
-      for (const branchLine of localBranches.split("\n")) {
-        const branch = branchLine.trim().replace(/^\* /, "");
-        if (!branch || /^ralph\/worker-\d+$/.test(branch)) continue;
+      // Delete remaining local ralph/* branches
+      const { stdout: localBranches } = gitSync(state.mainRepo, "branch", "--list", "ralph/*");
+      if (localBranches) {
+        for (const branchLine of localBranches.split("\n")) {
+          const branch = branchLine.trim().replace(/^\* /, "");
+          if (!branch || /^ralph\/worker-\d+$/.test(branch)) continue;
 
-        const { stdout: ahead } = gitSync(state.mainRepo, "log", "--oneline", `origin/${branch}..${branch}`);
-        if (!ahead) {
-          const { stdout: aheadMaster } = gitSync(state.mainRepo, "log", "--oneline", `master..${branch}`);
-          if (aheadMaster) {
+          const { stdout: ahead } = gitSync(state.mainRepo, "log", "--oneline", `origin/${branch}..${branch}`);
+          if (!ahead) {
+            const { stdout: aheadMaster } = gitSync(state.mainRepo, "log", "--oneline", `master..${branch}`);
+            if (aheadMaster) {
+              log(`  Pushing unpushed work on ${branch} before cleanup`);
+              gitSync(state.mainRepo, "push", "origin", `${branch}:${branch}`, "--force");
+            }
+          } else {
             log(`  Pushing unpushed work on ${branch} before cleanup`);
             gitSync(state.mainRepo, "push", "origin", `${branch}:${branch}`, "--force");
           }
-        } else {
-          log(`  Pushing unpushed work on ${branch} before cleanup`);
-          gitSync(state.mainRepo, "push", "origin", `${branch}:${branch}`, "--force");
+
+          gitSync(state.mainRepo, "branch", "-D", branch);
+          log(`  Cleaned up local branch: ${branch}`, "OK");
         }
-
-        gitSync(state.mainRepo, "branch", "-D", branch);
-        log(`  Cleaned up local branch: ${branch}`, "OK");
       }
+
+      // Create PRs for Done tasks
+      await createPRsForDoneTasks(state);
+
+      // Prune stale worktree refs
+      gitSync(state.mainRepo, "worktree", "prune");
     }
-
-    // Create PRs for Done tasks
-    await createPRsForDoneTasks(state);
-
-    // Prune stale worktree refs
-    gitSync(state.mainRepo, "worktree", "prune");
   }
 
   console.log();
