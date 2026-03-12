@@ -19,13 +19,11 @@ function spawnClaude(
   cwd: string,
   env?: NodeJS.ProcessEnv,
 ): ChildProcess {
-  // shell: false avoids cmd.exe intermediary that breaks stdin piping with detached processes.
-  // detached: true prevents Ctrl+C SIGINT from propagating to workers.
+  // shell: false avoids cmd.exe's 8191-char limit and resolves the exe directly.
   const child = spawn(resolvedClaudePath, args, {
     cwd,
     stdio: ["pipe", "pipe", "pipe"],
     shell: false,
-    detached: true,
     windowsHide: true,
     env,
   });
