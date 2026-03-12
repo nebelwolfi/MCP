@@ -1,12 +1,16 @@
-import { readFile, writeFile, readdir, mkdir, rm, access } from "node:fs/promises";
+import { readFile, writeFile, readdir, mkdir, rm, access, unlink } from "node:fs/promises";
 import { openSync, closeSync, unlinkSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
 import type { Task, BoardIndex } from "./types.js";
-import { TASKS_DIR, CONFIG_FILE, TASKS_INDEX_FILE, VERSION_FILE, BOARD_VERSION, DEFAULT_COLUMNS, BOARDS_ROOT } from "./constants.js";
+import { TASKS_DIR, INDEX_FILE, VERSION_FILE, BOARD_VERSION, DEFAULT_COLUMNS, BOARDS_ROOT, V1_CONFIG_FILE, V1_TASKS_INDEX_FILE } from "./constants.js";
 import { cwd, boardPath, now } from "./helpers.js";
-import { parseFrontmatter, toMarkdown, parseSubtasks, parseRelations, serializeSubtasks, serializeRelations } from "./parsers.js";
+import {
+  parseFrontmatter, toMarkdown,
+  parseSubtasks, parseRelations,
+  taskToYaml, taskFromYaml, indexToYaml, indexFromYaml,
+} from "./parsers.js";
 
 const LOCK_FILE = ".lock";
 const OLD_KANBN_DIR = ".kanbn";
@@ -60,146 +64,37 @@ export async function withLock<T>(fn: () => Promise<T>): Promise<T> {
 // ── Board existence ────────────────────────────────────────────────────
 
 export async function boardExists(): Promise<boolean> {
-  try { await access(boardPath(CONFIG_FILE)); return true; } catch { return false; }
+  try { await access(boardPath(INDEX_FILE)); return true; } catch {}
+  // Also check v1 format
+  try { await access(boardPath(V1_CONFIG_FILE)); return true; } catch {}
+  return false;
 }
 
-// ── Config (config.md) ─────────────────────────────────────────────────
-
-export async function readConfig(): Promise<{ name: string; startedColumns: string[]; completedColumns: string[] }> {
-  const content = await readFile(boardPath(CONFIG_FILE), "utf-8");
-  const { frontmatter, body } = parseFrontmatter(content);
-
-  const nameMatch = body.match(/^# (.+)$/m);
-  const name = nameMatch ? nameMatch[1].trim() : basename(cwd());
-
-  return {
-    name,
-    startedColumns: Array.isArray(frontmatter.startedColumns) ? frontmatter.startedColumns as string[] : [],
-    completedColumns: Array.isArray(frontmatter.completedColumns) ? frontmatter.completedColumns as string[] : [],
-  };
-}
-
-export async function writeConfig(config: { name: string; startedColumns: string[]; completedColumns: string[] }): Promise<void> {
-  await mkdir(boardPath(), { recursive: true });
-
-  const fm: Record<string, string[]> = {};
-  if (config.startedColumns?.length) fm.startedColumns = config.startedColumns;
-  if (config.completedColumns?.length) fm.completedColumns = config.completedColumns;
-
-  const body = `# ${config.name}`;
-  await writeFile(boardPath(CONFIG_FILE), toMarkdown(fm, body));
-}
-
-// ── Tasks index (tasks.md) ─────────────────────────────────────────────
-
-interface TasksIndex {
-  columns: string[];
-  tasksByColumn: Record<string, { id: string; title: string }[]>;
-}
-
-export async function readTasksIndex(): Promise<TasksIndex> {
-  const content = await readFile(boardPath(TASKS_INDEX_FILE), "utf-8");
-
-  const columns: string[] = [];
-  const tasksByColumn: Record<string, { id: string; title: string }[]> = {};
-  const h2Regex = /^## (.+)$/gm;
-  const h2Positions: { name: string; start: number; end: number }[] = [];
-  let m: RegExpExecArray | null;
-
-  while ((m = h2Regex.exec(content)) !== null) {
-    h2Positions.push({ name: m[1].trim(), start: m.index, end: m.index + m[0].length });
-  }
-
-  for (let i = 0; i < h2Positions.length; i++) {
-    const col = h2Positions[i].name;
-    columns.push(col);
-    tasksByColumn[col] = [];
-
-    const sectionText = content.slice(
-      h2Positions[i].end,
-      i + 1 < h2Positions.length ? h2Positions[i + 1].start : content.length
-    );
-
-    // Match: - [Title](tasks/{hash}/task.md)
-    const linkRegex = /^- \[([^\]]+)\]\(tasks\/([^/]+)\/task\.md\)/gm;
-    let lm: RegExpExecArray | null;
-    while ((lm = linkRegex.exec(sectionText)) !== null) {
-      tasksByColumn[col].push({ id: lm[2], title: lm[1] });
-    }
-  }
-
-  return { columns, tasksByColumn };
-}
-
-export async function writeTasksIndex(columns: string[], tasksByColumn: Record<string, string[]>, titleMap: Record<string, string>): Promise<void> {
-  await mkdir(boardPath(), { recursive: true });
-
-  let body = "";
-  for (const col of columns) {
-    const tasks = tasksByColumn[col] ?? [];
-    body += `## ${col}\n`;
-    if (tasks.length > 0) {
-      body += "\n";
-      for (const id of tasks) {
-        const title = titleMap[id] ?? id;
-        body += `- [${title}](tasks/${id}/task.md)\n`;
-      }
-    }
-    body += "\n";
-  }
-
-  await writeFile(boardPath(TASKS_INDEX_FILE), body);
-}
-
-// ── Combined index (merges config + tasks index) ───────────────────────
+// ── Index I/O (v2: index.yaml) ─────────────────────────────────────────
 
 export async function readIndex(): Promise<BoardIndex> {
-  const config = await readConfig();
-  const tasksIdx = await readTasksIndex();
+  // Try v2 format first
+  try {
+    const content = await readFile(boardPath(INDEX_FILE), "utf-8");
+    return indexFromYaml(content);
+  } catch {}
 
-  // Convert { id, title }[] to just id[]
-  const tasksByColumn: Record<string, string[]> = {};
-  for (const [col, tasks] of Object.entries(tasksIdx.tasksByColumn)) {
-    tasksByColumn[col] = tasks.map((t) => t.id);
-  }
-
-  return {
-    name: config.name,
-    columns: tasksIdx.columns,
-    tasksByColumn,
-    startedColumns: config.startedColumns,
-    completedColumns: config.completedColumns,
-  };
+  // Fall back to v1 format (config.md + tasks.md)
+  return readIndexV1();
 }
 
 export async function writeIndex(index: BoardIndex): Promise<void> {
-  await writeConfig({
-    name: index.name,
-    startedColumns: index.startedColumns,
-    completedColumns: index.completedColumns,
-  });
-
-  // Build title map from task files (authoritative source for titles)
-  const titleMap: Record<string, string> = {};
-  for (const ids of Object.values(index.tasksByColumn)) {
-    for (const id of ids) {
-      if (!titleMap[id]) {
-        try {
-          const task = await readTask(id);
-          titleMap[id] = task.title;
-        } catch {
-          titleMap[id] = id;
-        }
-      }
-    }
-  }
-
-  await writeTasksIndex(index.columns, index.tasksByColumn, titleMap);
+  await mkdir(boardPath(), { recursive: true });
+  await writeFile(boardPath(INDEX_FILE), indexToYaml(index));
 }
 
-// ── Task I/O (folder-based) ────────────────────────────────────────────
+// ── Task I/O (v2: flat yaml files) ─────────────────────────────────────
 
-function taskDir(id: string): string {
+function taskFile(id: string): string {
+  return boardPath(TASKS_DIR, `${id}.yaml`);
+}
+
+function taskDirV1(id: string): string {
   return boardPath(TASKS_DIR, id);
 }
 
@@ -208,63 +103,26 @@ async function readFileOrEmpty(path: string): Promise<string> {
 }
 
 export async function readTask(id: string): Promise<Task> {
-  const taskMd = await readFile(join(taskDir(id), "task.md"), "utf-8");
-  const { frontmatter, body } = parseFrontmatter(taskMd);
+  // Try v2 format first (flat yaml)
+  try {
+    const content = await readFile(taskFile(id), "utf-8");
+    return taskFromYaml(content, id);
+  } catch {}
 
-  const titleMatch = body.match(/^# (.+)$/m);
-  const title = titleMatch ? titleMatch[1].trim() : id;
-
-  const detailsContent = await readFileOrEmpty(join(taskDir(id), "details.md"));
-  const subtasksContent = await readFileOrEmpty(join(taskDir(id), "subtasks.md"));
-  const relationsContent = await readFileOrEmpty(join(taskDir(id), "relations.md"));
-
-  return {
-    id,
-    title,
-    description: detailsContent.trim(),
-    subtasks: parseSubtasks(subtasksContent),
-    relations: parseRelations(relationsContent),
-    created: (frontmatter.created as string) ?? now(),
-    updated: (frontmatter.updated as string) ?? now(),
-    started: frontmatter.started as string | undefined,
-    completed: frontmatter.completed as string | undefined,
-    priority: (frontmatter.priority as Task["priority"]) ?? "medium",
-    assignee: (frontmatter.assignee as string) ?? "",
-    tags: Array.isArray(frontmatter.tags)
-      ? frontmatter.tags as string[]
-      : frontmatter.tags ? [frontmatter.tags as string] : [],
-  };
+  // Fall back to v1 format (folder with .md files)
+  return readTaskV1(id);
 }
 
 export async function writeTask(task: Task): Promise<void> {
-  const dir = taskDir(task.id);
-  await mkdir(dir, { recursive: true });
-
-  // task.md — frontmatter + title
-  const fm: Record<string, string | string[]> = {
-    created: task.created ?? now(),
-    updated: now(),
-  };
-  if (task.started)   fm.started   = task.started;
-  if (task.completed) fm.completed = task.completed;
-  if (task.priority && task.priority !== "medium") fm.priority = task.priority;
-  if (task.assignee)  fm.assignee  = task.assignee;
-  if (task.tags?.length) fm.tags   = task.tags;
-
-  await writeFile(join(dir, "task.md"), toMarkdown(fm, `# ${task.title}`));
-
-  // details.md
-  await writeFile(join(dir, "details.md"), task.description || "");
-
-  // subtasks.md
-  await writeFile(join(dir, "subtasks.md"), serializeSubtasks(task.subtasks ?? []));
-
-  // relations.md
-  await writeFile(join(dir, "relations.md"), serializeRelations(task.relations ?? []));
+  await mkdir(boardPath(TASKS_DIR), { recursive: true });
+  await writeFile(taskFile(task.id), taskToYaml(task));
 }
 
 export async function deleteTaskFile(id: string): Promise<void> {
-  await rm(taskDir(id), { recursive: true, force: true });
+  // Delete v2 file
+  try { await unlink(taskFile(id)); } catch {}
+  // Also clean up legacy v1 folder if it exists
+  try { await rm(taskDirV1(id), { recursive: true, force: true }); } catch {}
 }
 
 // ── Listing helpers ────────────────────────────────────────────────────
@@ -294,10 +152,17 @@ export async function listOrphanedFiles(): Promise<string[]> {
     const entries = await readdir(boardPath(TASKS_DIR), { withFileTypes: true });
     const index = await readIndex();
     const indexed = new Set(index.columns.flatMap((c) => index.tasksByColumn[c] ?? []));
-    return entries
-      .filter((e) => e.isDirectory())
-      .map((e) => e.name)
-      .filter((name) => !indexed.has(name));
+    const orphans: string[] = [];
+    for (const e of entries) {
+      if (e.isFile() && e.name.endsWith(".yaml")) {
+        const id = e.name.replace(/\.yaml$/, "");
+        if (!indexed.has(id)) orphans.push(id);
+      } else if (e.isDirectory()) {
+        // Legacy v1 folder
+        if (!indexed.has(e.name)) orphans.push(e.name);
+      }
+    }
+    return orphans;
   } catch { return []; }
 }
 
@@ -305,28 +170,160 @@ export async function listOrphanedFiles(): Promise<string[]> {
 
 export async function ensureBoard(): Promise<void> {
   await ensureBoardsRootGit();
-  if (await boardExists()) return;
 
-  // Check for old-format board to migrate
+  // Check for existing v2 board
+  try {
+    await access(boardPath(INDEX_FILE));
+    return;
+  } catch {}
+
+  // Check for v1 board to migrate
+  try {
+    await access(boardPath(V1_CONFIG_FILE));
+    await migrateFromV1();
+    return;
+  } catch {}
+
+  // Check for old-format (v0) board to migrate
   const oldIndexPath = join(cwd(), OLD_KANBN_DIR, "index.md");
   try {
     await access(oldIndexPath);
     await migrateFromV0(join(cwd(), OLD_KANBN_DIR));
     return;
-  } catch { /* no old board, create fresh */ }
+  } catch {}
 
+  // Create fresh v2 board
   await mkdir(boardPath(TASKS_DIR), { recursive: true });
   await writeFile(boardPath(VERSION_FILE), BOARD_VERSION);
-  await writeConfig({
+
+  const index: BoardIndex = {
     name: basename(cwd()),
+    columns: [...DEFAULT_COLUMNS],
+    tasksByColumn: Object.fromEntries(DEFAULT_COLUMNS.map((c) => [c, []])),
     startedColumns: ["In Progress"],
     completedColumns: ["Done"],
-  });
-  await writeTasksIndex(
-    [...DEFAULT_COLUMNS],
-    Object.fromEntries(DEFAULT_COLUMNS.map((c) => [c, []])),
-    {}
-  );
+  };
+  await writeIndex(index);
+}
+
+// ── V1 reading helpers (used by migration and fallback) ────────────────
+
+async function readConfigV1(): Promise<{ name: string; startedColumns: string[]; completedColumns: string[] }> {
+  const content = await readFile(boardPath(V1_CONFIG_FILE), "utf-8");
+  const { frontmatter, body } = parseFrontmatter(content);
+
+  const nameMatch = body.match(/^# (.+)$/m);
+  const name = nameMatch ? nameMatch[1].trim() : basename(cwd());
+
+  return {
+    name,
+    startedColumns: Array.isArray(frontmatter.startedColumns) ? frontmatter.startedColumns as string[] : [],
+    completedColumns: Array.isArray(frontmatter.completedColumns) ? frontmatter.completedColumns as string[] : [],
+  };
+}
+
+async function readTasksIndexV1(): Promise<{ columns: string[]; tasksByColumn: Record<string, string[]> }> {
+  const content = await readFile(boardPath(V1_TASKS_INDEX_FILE), "utf-8");
+
+  const columns: string[] = [];
+  const tasksByColumn: Record<string, string[]> = {};
+  const h2Regex = /^## (.+)$/gm;
+  const h2Positions: { name: string; start: number; end: number }[] = [];
+  let m: RegExpExecArray | null;
+
+  while ((m = h2Regex.exec(content)) !== null) {
+    h2Positions.push({ name: m[1].trim(), start: m.index, end: m.index + m[0].length });
+  }
+
+  for (let i = 0; i < h2Positions.length; i++) {
+    const col = h2Positions[i].name;
+    columns.push(col);
+    tasksByColumn[col] = [];
+
+    const sectionText = content.slice(
+      h2Positions[i].end,
+      i + 1 < h2Positions.length ? h2Positions[i + 1].start : content.length
+    );
+
+    const linkRegex = /^- \[([^\]]+)\]\(tasks\/([^/]+)\/(task\.md|task\.yaml)\)/gm;
+    let lm: RegExpExecArray | null;
+    while ((lm = linkRegex.exec(sectionText)) !== null) {
+      tasksByColumn[col].push(lm[2]);
+    }
+  }
+
+  return { columns, tasksByColumn };
+}
+
+async function readIndexV1(): Promise<BoardIndex> {
+  const config = await readConfigV1();
+  const tasksIdx = await readTasksIndexV1();
+
+  return {
+    name: config.name,
+    columns: tasksIdx.columns,
+    tasksByColumn: tasksIdx.tasksByColumn,
+    startedColumns: config.startedColumns,
+    completedColumns: config.completedColumns,
+  };
+}
+
+async function readTaskV1(id: string): Promise<Task> {
+  const dir = taskDirV1(id);
+  const taskMd = await readFile(join(dir, "task.md"), "utf-8");
+  const { frontmatter, body } = parseFrontmatter(taskMd);
+
+  const titleMatch = body.match(/^# (.+)$/m);
+  const title = titleMatch ? titleMatch[1].trim() : id;
+
+  const detailsContent = await readFileOrEmpty(join(dir, "details.md"));
+  const subtasksContent = await readFileOrEmpty(join(dir, "subtasks.md"));
+  const relationsContent = await readFileOrEmpty(join(dir, "relations.md"));
+
+  return {
+    id,
+    title,
+    description: detailsContent.trim(),
+    subtasks: parseSubtasks(subtasksContent),
+    relations: parseRelations(relationsContent),
+    created: (frontmatter.created as string) ?? now(),
+    updated: (frontmatter.updated as string) ?? now(),
+    started: frontmatter.started as string | undefined,
+    completed: frontmatter.completed as string | undefined,
+    priority: (frontmatter.priority as Task["priority"]) ?? "medium",
+    assignee: (frontmatter.assignee as string) ?? "",
+    tags: Array.isArray(frontmatter.tags)
+      ? frontmatter.tags as string[]
+      : frontmatter.tags ? [frontmatter.tags as string] : [],
+  };
+}
+
+// ── Migration from v1 (config.md + tasks.md + task folders) ────────────
+
+async function migrateFromV1(): Promise<void> {
+  const index = await readIndexV1();
+
+  // Migrate each task: read from v1 folder, write as flat yaml
+  for (const col of index.columns) {
+    for (const id of (index.tasksByColumn[col] ?? [])) {
+      try {
+        const task = await readTaskV1(id);
+        await writeTask(task);
+        // Remove old task folder
+        await rm(taskDirV1(id), { recursive: true, force: true });
+      } catch { /* skip unreadable tasks */ }
+    }
+  }
+
+  // Write v2 index
+  await writeIndex(index);
+
+  // Update version
+  await writeFile(boardPath(VERSION_FILE), BOARD_VERSION);
+
+  // Clean up old v1 files
+  try { await unlink(boardPath(V1_CONFIG_FILE)); } catch {}
+  try { await unlink(boardPath(V1_TASKS_INDEX_FILE)); } catch {}
 }
 
 // ── Migration from v0 (.kanbn/) ────────────────────────────────────────
@@ -374,12 +371,9 @@ async function migrateFromV0(oldRoot: string): Promise<void> {
 
   // Create new board structure
   await mkdir(boardPath(TASKS_DIR), { recursive: true });
-  await writeFile(boardPath(VERSION_FILE), BOARD_VERSION);
-  await writeConfig({ name, startedColumns, completedColumns });
 
   // Migrate tasks: read old files, assign new IDs
   const oldToNewId: Record<string, string> = {};
-  const titleMap: Record<string, string> = {};
   const migratedTasks: Task[] = [];
 
   for (const col of columns) {
@@ -427,7 +421,6 @@ async function migrateFromV0(oldRoot: string): Promise<void> {
 
         const newId = generateTaskId();
         oldToNewId[oldId] = newId;
-        titleMap[newId] = title;
 
         migratedTasks.push({
           id: newId,
@@ -458,12 +451,12 @@ async function migrateFromV0(oldRoot: string): Promise<void> {
     }
   }
 
-  // Write migrated tasks
+  // Write migrated tasks as v2 flat yaml files
   for (const task of migratedTasks) {
     await writeTask(task);
   }
 
-  // Write tasks index with new IDs
+  // Build v2 index
   const newTasksByColumn: Record<string, string[]> = {};
   for (const col of columns) {
     newTasksByColumn[col] = (oldTasksByColumn[col] ?? [])
@@ -471,7 +464,15 @@ async function migrateFromV0(oldRoot: string): Promise<void> {
       .filter(Boolean);
   }
 
-  await writeTasksIndex(columns, newTasksByColumn, titleMap);
+  const index: BoardIndex = {
+    name,
+    columns,
+    tasksByColumn: newTasksByColumn,
+    startedColumns,
+    completedColumns,
+  };
+  await writeIndex(index);
+  await writeFile(boardPath(VERSION_FILE), BOARD_VERSION);
 
   // Rename old board to .kanbn.bak
   const { rename } = await import("node:fs/promises");

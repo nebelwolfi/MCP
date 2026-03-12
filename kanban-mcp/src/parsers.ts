@@ -1,4 +1,5 @@
-import type { Frontmatter, Subtask, Relation } from "./types.js";
+import YAML from "yaml";
+import type { Frontmatter, Subtask, Relation, Task, BoardIndex } from "./types.js";
 
 export function parseFrontmatter(content: string): { frontmatter: Frontmatter; body: string } {
   content = content.replace(/^\uFEFF/, "");
@@ -105,4 +106,101 @@ export function serializeRelations(relations: Relation[]): string {
     const label = r.type ? `${r.type} ${r.taskId}` : r.taskId;
     return `- [${label}](${r.taskId}/task.md)`;
   }).join("\n") + "\n";
+}
+
+// ── YAML format (v2) ─────────────────────────────────────────────────
+
+export function taskToYaml(task: Task): string {
+  const obj: Record<string, unknown> = { title: task.title };
+
+  obj.created = task.created;
+  obj.updated = task.updated;
+  if (task.started) obj.started = task.started;
+  if (task.completed) obj.completed = task.completed;
+  if (task.priority && task.priority !== "medium") obj.priority = task.priority;
+  if (task.assignee) obj.assignee = task.assignee;
+  if (task.tags?.length) obj.tags = task.tags;
+  if (task.description) obj.description = task.description;
+  if (task.relations?.length) {
+    obj.relations = task.relations.map((r) =>
+      r.type ? `${r.type} ${r.taskId}` : r.taskId
+    );
+  }
+  if (task.subtasks?.length) {
+    obj.subtasks = task.subtasks.map((st) =>
+      `[${st.completed ? "x" : " "}] ${st.text}`
+    );
+  }
+
+  return YAML.stringify(obj, { lineWidth: 0 });
+}
+
+export function taskFromYaml(content: string, id: string): Task {
+  const obj = YAML.parse(content) ?? {};
+
+  const subtasks: Subtask[] = (obj.subtasks ?? []).map((s: string) => {
+    const m = s.match(/^\[([ xX])\] (.+)$/);
+    return m
+      ? { text: m[2].trim(), completed: m[1] !== " " }
+      : { text: s, completed: false };
+  });
+
+  const relations: Relation[] = (obj.relations ?? []).map((s: string) => {
+    const parts = s.split(" ");
+    return parts.length > 1
+      ? { type: parts[0], taskId: parts.slice(1).join(" ") }
+      : { type: "", taskId: parts[0] };
+  });
+
+  return {
+    id,
+    title: obj.title ?? id,
+    description: obj.description ?? "",
+    subtasks,
+    relations,
+    created: obj.created ?? "",
+    updated: obj.updated ?? "",
+    started: obj.started,
+    completed: obj.completed,
+    priority: obj.priority ?? "medium",
+    assignee: obj.assignee ?? "",
+    tags: Array.isArray(obj.tags) ? obj.tags : obj.tags ? [obj.tags] : [],
+  };
+}
+
+export function indexToYaml(index: BoardIndex): string {
+  const obj: Record<string, unknown> = { name: index.name };
+  if (index.startedColumns?.length) obj.startedColumns = index.startedColumns;
+  if (index.completedColumns?.length) obj.completedColumns = index.completedColumns;
+
+  // columns as ordered map: { columnName: [taskId, ...] }
+  const columns: Record<string, string[]> = {};
+  for (const col of index.columns) {
+    columns[col] = index.tasksByColumn[col] ?? [];
+  }
+  obj.columns = columns;
+
+  return YAML.stringify(obj, { lineWidth: 0 });
+}
+
+export function indexFromYaml(content: string): BoardIndex {
+  const obj = YAML.parse(content) ?? {};
+
+  const columns: string[] = [];
+  const tasksByColumn: Record<string, string[]> = {};
+
+  if (obj.columns && typeof obj.columns === "object") {
+    for (const [col, tasks] of Object.entries(obj.columns)) {
+      columns.push(col);
+      tasksByColumn[col] = Array.isArray(tasks) ? (tasks as string[]) : [];
+    }
+  }
+
+  return {
+    name: obj.name ?? "",
+    columns,
+    tasksByColumn,
+    startedColumns: Array.isArray(obj.startedColumns) ? obj.startedColumns : [],
+    completedColumns: Array.isArray(obj.completedColumns) ? obj.completedColumns : [],
+  };
 }
