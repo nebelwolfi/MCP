@@ -1,6 +1,7 @@
 import type { Frontmatter, Subtask, Relation } from "./types.js";
 
 export function parseFrontmatter(content: string): { frontmatter: Frontmatter; body: string } {
+  content = content.replace(/^\uFEFF/, "");
   const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
   if (!match) return { frontmatter: {}, body: content.trim() };
 

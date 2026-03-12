@@ -152,7 +152,7 @@ foreach ($comp in $toInstall) {
                     Write-Host "  MCP server '$name' already registered."
                 } else {
                     Write-Host "  Registering MCP server: $name -> $entryPoint"
-                    claude mcp add --scope user $name node $entryPoint
+                    claude mcp add --scope user $name node $entryPoint 2>$null
                 }
             } else {
                 Write-Warning "  Entry point not found: $entryPoint - skipping MCP registration"
