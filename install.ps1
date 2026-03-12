@@ -143,16 +143,20 @@ foreach ($comp in $toInstall) {
         Pop-Location
 
         if ($comp.Type -eq "mcp") {
-            # Register MCP server (only if not already registered)
+            # Register MCP server with clean name (strip -mcp suffix)
+            $mcpName = $name -replace '-mcp$', ''
             $main = if ($comp.PackageJson.main) { $comp.PackageJson.main } else { "index.js" }
             $entryPoint = Join-Path $comp.Dir $main
             if (Test-Path $entryPoint) {
-                $existing = claude mcp get --scope user $name 2>$null
+                # Remove legacy -mcp suffixed registration if present
+                claude mcp remove --scope user $name 2>$null
+
+                $existing = claude mcp get --scope user $mcpName 2>$null
                 if ($LASTEXITCODE -eq 0 -and $existing) {
-                    Write-Host "  MCP server '$name' already registered."
+                    Write-Host "  MCP server '$mcpName' already registered."
                 } else {
-                    Write-Host "  Registering MCP server: $name -> $entryPoint"
-                    claude mcp add --scope user $name node $entryPoint 2>$null
+                    Write-Host "  Registering MCP server: $mcpName -> $entryPoint"
+                    claude mcp add --scope user $mcpName node $entryPoint 2>$null
                 }
             } else {
                 Write-Warning "  Entry point not found: $entryPoint - skipping MCP registration"
