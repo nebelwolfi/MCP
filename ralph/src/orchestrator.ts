@@ -290,7 +290,7 @@ export async function runMain(config: Config): Promise<void> {
           await moveKanbanTask(state.mainRepo, jobInfo.taskId, "Done");
           state.completedTasks.add(jobInfo.taskId);
           createTaskPR(state, jobInfo.taskId);
-          releaseTaskClaim(state, jobInfo.taskId);
+          await releaseTaskClaim(state,jobInfo.taskId);
 
           if (await isBoardComplete(state.mainRepo)) {
             log("All tasks are in Done column with complete subtasks", "OK");
@@ -315,15 +315,15 @@ export async function runMain(config: Config): Promise<void> {
             await moveKanbanTask(state.mainRepo, jobInfo.taskId, "Done");
             state.completedTasks.add(jobInfo.taskId);
             createTaskPR(state, jobInfo.taskId);
-            releaseTaskClaim(state, jobInfo.taskId);
+            await releaseTaskClaim(state,jobInfo.taskId);
           }
         }
       } else if (result.status === "ERROR") {
         await moveKanbanTask(state.mainRepo, jobInfo.taskId, "Todo");
-        releaseTaskClaim(state, jobInfo.taskId);
+        await releaseTaskClaim(state,jobInfo.taskId);
         log(`Task ${jobInfo.taskId} errored: ${result.error}`, "WARN");
       } else if (result.status !== "NO_COMMITS") {
-        releaseTaskClaim(state, jobInfo.taskId);
+        await releaseTaskClaim(state,jobInfo.taskId);
       }
 
       // Decide next work
@@ -361,7 +361,7 @@ export async function runMain(config: Config): Promise<void> {
                 await moveKanbanTask(state.mainRepo, jobInfo.taskId, "Done");
                 state.completedTasks.add(jobInfo.taskId);
                 createTaskPR(state, jobInfo.taskId);
-                releaseTaskClaim(state, jobInfo.taskId);
+                await releaseTaskClaim(state,jobInfo.taskId);
                 advanced = true;
 
                 if (await isBoardComplete(state.mainRepo)) {
@@ -377,7 +377,7 @@ export async function runMain(config: Config): Promise<void> {
             if (ncCount >= 5) {
               log(`Worker ${workerId}: ${ncCount} NO_COMMITS on ${ncKey}, giving up`, "WARN");
               await moveKanbanTask(state.mainRepo, jobInfo.taskId, "Todo");
-              releaseTaskClaim(state, jobInfo.taskId);
+              await releaseTaskClaim(state,jobInfo.taskId);
               noCommitCounts.delete(ncKey);
             } else {
               // Reset worktree after 3 consecutive failures
@@ -508,7 +508,7 @@ export async function runMain(config: Config): Promise<void> {
     // Move uncompleted claimed tasks back
     for (const [taskId] of state.claimedTasks) {
       await moveKanbanTask(state.mainRepo, taskId, "In Progress");
-      releaseTaskClaim(state, taskId);
+      await releaseTaskClaim(state,taskId);
     }
 
     // Remove worktrees

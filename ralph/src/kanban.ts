@@ -1,6 +1,6 @@
 import type { Task } from "kanban-mcp/types";
 import { readTask, writeTask, readIndex, getAllTasksWithColumns } from "kanban-mcp/storage";
-import { moveTask } from "kanban-mcp/operations";
+import { moveTask, editTask } from "kanban-mcp/operations";
 import type { TaskInfo, BoardJson, ClaimResult, OrchestratorState } from "./types.js";
 import { log } from "./logger.js";
 import { ghSync, gitSync } from "./git.js";
@@ -120,6 +120,21 @@ export async function moveKanbanTask(repoPath: string, taskId: string, column: s
   return withRoot(repoPath, async () => {
     try {
       await moveTask(taskId, column);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+}
+
+export async function editKanbanTask(
+  repoPath: string,
+  taskId: string,
+  updates: Partial<Pick<Task, "title" | "description" | "priority" | "assignee" | "tags">>,
+): Promise<boolean> {
+  return withRoot(repoPath, async () => {
+    try {
+      await editTask(taskId, updates);
       return true;
     } catch {
       return false;
@@ -418,6 +433,7 @@ export async function claimNextTask(
   const claimedSubTask = getFirstIncompleteSubTask(taskObj);
 
   await moveKanbanTask(state.mainRepo, taskId, "In Progress");
+  await editKanbanTask(state.mainRepo, taskId, { assignee: `ralph-worker-${workerId}` });
 
   state.claimedTasks.set(taskId, workerId);
   if (claimedSubTask) {
@@ -431,7 +447,8 @@ export async function claimNextTask(
   return { taskId, claimedSubTask };
 }
 
-export function releaseTaskClaim(state: OrchestratorState, taskId: string): void {
+export async function releaseTaskClaim(state: OrchestratorState, taskId: string): Promise<void> {
   state.claimedTasks.delete(taskId);
   state.claimedSubTasks.delete(taskId);
+  await editKanbanTask(state.mainRepo, taskId, { assignee: "" });
 }
