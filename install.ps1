@@ -143,19 +143,23 @@ foreach ($comp in $toInstall) {
         Pop-Location
 
         if ($comp.Type -eq "mcp") {
-            # Register MCP server
+            # Register MCP server (only if not already registered)
             $main = if ($comp.PackageJson.main) { $comp.PackageJson.main } else { "index.js" }
             $entryPoint = Join-Path $comp.Dir $main
             if (Test-Path $entryPoint) {
-                Write-Host "  Registering MCP server: $name -> $entryPoint"
-                claude mcp remove --scope user $name 2>$null
-                claude mcp add --scope user $name node $entryPoint
+                $existing = claude mcp get --scope user $name 2>$null
+                if ($LASTEXITCODE -eq 0 -and $existing) {
+                    Write-Host "  MCP server '$name' already registered."
+                } else {
+                    Write-Host "  Registering MCP server: $name -> $entryPoint"
+                    claude mcp add --scope user $name node $entryPoint
+                }
             } else {
                 Write-Warning "  Entry point not found: $entryPoint - skipping MCP registration"
             }
         }
 
-        # Register bin commands globally via npm link
+        # Register CLI tools globally via npm link (any package with bin entries)
         if ($comp.PackageJson.bin) {
             Write-Host "  Linking CLI commands globally..."
             Push-Location $comp.Dir

@@ -7,9 +7,6 @@
   "installConfig": {
     "displayName": "Capstone Disassembler MCP"
   },
-  "bin": {
-    "capstone-mcp": "dist/index.js"
-  },
   "scripts": {
     "build": "tsc",
     "prepare": "npm run build"

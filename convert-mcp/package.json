@@ -7,9 +7,6 @@
   "installConfig": {
     "displayName": "Converter MCP (dec/hex)"
   },
-  "bin": {
-    "convert-mcp": "dist/index.js"
-  },
   "scripts": {
     "build": "tsc",
     "prepare": "npm run build"

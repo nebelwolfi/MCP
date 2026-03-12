@@ -9,7 +9,6 @@
     "prerequisites": []
   },
   "bin": {
-    "kanban-mcp": "dist/index.js",
     "Kanban-Open": "dist/web.js",
     "kanban": "dist/cli.js"
   },
